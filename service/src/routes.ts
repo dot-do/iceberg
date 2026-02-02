@@ -8,6 +8,7 @@
 
 import { Hono } from 'hono';
 import type { Context } from 'hono';
+import JSONBig from 'json-bigint';
 import type { Env } from './index.js';
 import {
   requireNamespacePermission,
@@ -263,6 +264,28 @@ interface ContextVariables extends AuthorizationVariables {
 }
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+/**
+ * Reserved table property names per Iceberg spec.
+ * These properties are used to control behavior during table creation/update
+ * but are NOT persisted in the table properties map.
+ * @see https://iceberg.apache.org/spec/
+ */
+const RESERVED_PROPERTIES = new Set([
+  'format-version',
+  'uuid',
+  'snapshot-count',
+  'current-snapshot-id',
+  'current-snapshot-summary',
+  'current-snapshot-timestamp',
+  'current-schema',
+  'default-partition-spec',
+  'default-sort-order',
+]);
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
@@ -324,6 +347,16 @@ function icebergError(
  */
 function isValidFieldId(id: unknown): id is number {
   return typeof id === 'number' && id > 0 && Number.isInteger(id);
+}
+
+/**
+ * Check if a string is a valid UUID format.
+ * Matches standard UUID format: 8-4-4-4-12 hexadecimal characters.
+ */
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isValidUUID(uuid: string): boolean {
+  return UUID_REGEX.test(uuid);
 }
 
 /**
@@ -787,6 +820,9 @@ function applyUpdates(
   for (const update of updates) {
     switch (update.action) {
       case 'assign-uuid':
+        if (!isValidUUID(update.uuid)) {
+          throw new Error(`Invalid UUID format: ${update.uuid}. UUIDs must be in the format xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`);
+        }
         result['table-uuid'] = update.uuid;
         break;
 
@@ -974,9 +1010,14 @@ function applyUpdates(
         break;
       }
 
-      case 'set-properties':
-        result.properties = { ...(result.properties ?? {}), ...update.updates };
+      case 'set-properties': {
+        // Filter out reserved properties - these are not persisted
+        const filteredUpdates = Object.fromEntries(
+          Object.entries(update.updates).filter(([key]) => !RESERVED_PROPERTIES.has(key))
+        );
+        result.properties = { ...(result.properties ?? {}), ...filteredUpdates };
         break;
+      }
 
       case 'remove-properties':
         result.properties = Object.fromEntries(
@@ -1099,34 +1140,36 @@ function canRebaseUpdates(
 
 /**
  * Validate table requirements against current metadata.
+ * Returns which requirement type failed (if any) for proper error messaging.
  */
 function validateRequirements(
   metadata: TableMetadata | null,
   requirements: TableRequirement[]
-): { valid: boolean; message?: string } {
+): { valid: boolean; message?: string; failedRequirement?: string } {
   for (const req of requirements) {
     switch (req.type) {
       case 'assert-create':
         if (metadata !== null) {
-          return { valid: false, message: 'Cannot commit: table already exists' };
+          return { valid: false, message: 'Requirement failed: table already exists', failedRequirement: 'assert-create' };
         }
         break;
 
       case 'assert-table-uuid':
         if (!metadata || metadata['table-uuid'] !== req.uuid) {
-          return { valid: false, message: `Cannot commit: table UUID mismatch expected ${req.uuid}, got ${metadata?.['table-uuid'] ?? 'null'}` };
+          return { valid: false, message: `Requirement failed: table UUID mismatch expected ${req.uuid}, got ${metadata?.['table-uuid'] ?? 'null'}`, failedRequirement: 'assert-table-uuid' };
         }
         break;
 
       case 'assert-ref-snapshot-id': {
         if (!metadata) {
-          return { valid: false, message: 'Cannot commit: table does not exist' };
+          return { valid: false, message: 'Requirement failed: table does not exist', failedRequirement: 'assert-ref-snapshot-id' };
         }
         const refSnapshotId = metadata.refs?.[req.ref]?.['snapshot-id'] ?? null;
         if (refSnapshotId !== req['snapshot-id']) {
           return {
             valid: false,
-            message: `Cannot commit: snapshot ID mismatch for ref ${req.ref} expected ${req['snapshot-id']}, got ${refSnapshotId}`,
+            message: `Requirement failed: snapshot ID mismatch for ref ${req.ref} expected ${req['snapshot-id']}, got ${refSnapshotId}`,
+            failedRequirement: 'assert-ref-snapshot-id',
           };
         }
         break;
@@ -1136,7 +1179,8 @@ function validateRequirements(
         if (!metadata || metadata['last-column-id'] !== req['last-assigned-field-id']) {
           return {
             valid: false,
-            message: `Cannot commit: last assigned field ID mismatch expected ${req['last-assigned-field-id']}, got ${metadata?.['last-column-id'] ?? 'null'}`,
+            message: 'Requirement failed: last assigned field id changed',
+            failedRequirement: 'assert-last-assigned-field-id',
           };
         }
         break;
@@ -1145,7 +1189,8 @@ function validateRequirements(
         if (!metadata || metadata['current-schema-id'] !== req['current-schema-id']) {
           return {
             valid: false,
-            message: `Cannot commit: current schema ID mismatch expected ${req['current-schema-id']}, got ${metadata?.['current-schema-id'] ?? 'null'}`,
+            message: 'Requirement failed: current schema changed',
+            failedRequirement: 'assert-current-schema-id',
           };
         }
         break;
@@ -1154,7 +1199,8 @@ function validateRequirements(
         if (!metadata || metadata['last-partition-id'] !== req['last-assigned-partition-id']) {
           return {
             valid: false,
-            message: `Cannot commit: last assigned partition ID mismatch expected ${req['last-assigned-partition-id']}, got ${metadata?.['last-partition-id'] ?? 'null'}`,
+            message: 'Requirement failed: last assigned partition id changed',
+            failedRequirement: 'assert-last-assigned-partition-id',
           };
         }
         break;
@@ -1163,7 +1209,8 @@ function validateRequirements(
         if (!metadata || metadata['default-spec-id'] !== req['default-spec-id']) {
           return {
             valid: false,
-            message: `Cannot commit: default spec ID mismatch expected ${req['default-spec-id']}, got ${metadata?.['default-spec-id'] ?? 'null'}`,
+            message: 'Requirement failed: default partition spec changed',
+            failedRequirement: 'assert-default-spec-id',
           };
         }
         break;
@@ -1172,7 +1219,8 @@ function validateRequirements(
         if (!metadata || metadata['default-sort-order-id'] !== req['default-sort-order-id']) {
           return {
             valid: false,
-            message: `Cannot commit: default sort order ID mismatch expected ${req['default-sort-order-id']}, got ${metadata?.['default-sort-order-id'] ?? 'null'}`,
+            message: 'Requirement failed: default sort order changed',
+            failedRequirement: 'assert-default-sort-order-id',
           };
         }
         break;
@@ -1843,6 +1891,20 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         const validation = validateRequirements(currentMetadata, requirements);
 
         if (!validation.valid) {
+          // Check which requirement failed - some requirements indicate true conflicts that cannot be rebased
+          const nonRebaseableRequirements = [
+            'assert-current-schema-id',
+            'assert-last-assigned-field-id',
+            'assert-default-spec-id',
+            'assert-last-assigned-partition-id',
+            'assert-default-sort-order-id',
+          ];
+
+          // If a non-rebaseable requirement failed, return the specific error message
+          if (validation.failedRequirement && nonRebaseableRequirements.includes(validation.failedRequirement)) {
+            return icebergError(c, validation.message!, 'CommitFailedException', 409);
+          }
+
           // Requirements don't match current state - check if server-side retry is possible
           // Server-side retry only applies when there are actual updates to rebase
           if (currentMetadata !== null && !hasAssertCreate && updates.length > 0) {
@@ -2463,6 +2525,9 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         for (const update of body.updates) {
           switch (update.action) {
             case 'assign-uuid':
+              if (!isValidUUID(update.uuid)) {
+                throw new Error(`Invalid UUID format: ${update.uuid}. UUIDs must be in the format xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`);
+              }
               newMetadata['view-uuid'] = update.uuid;
               break;
 
@@ -2494,9 +2559,14 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
               newMetadata['current-version-id'] = update['view-version-id'];
               break;
 
-            case 'set-properties':
-              newMetadata.properties = { ...(newMetadata.properties ?? {}), ...update.updates };
+            case 'set-properties': {
+              // Filter out reserved properties - these are not persisted
+              const filteredUpdates = Object.fromEntries(
+                Object.entries(update.updates).filter(([key]) => !RESERVED_PROPERTIES.has(key))
+              );
+              newMetadata.properties = { ...(newMetadata.properties ?? {}), ...filteredUpdates };
               break;
+            }
 
             case 'remove-properties':
               newMetadata.properties = Object.fromEntries(

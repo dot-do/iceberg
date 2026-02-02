@@ -90,12 +90,19 @@ export class TableNotFoundError extends CatalogError {
 
 /** Table already exists error */
 export class TableAlreadyExistsError extends CatalogError {
-  constructor(namespace: string[], name: string) {
-    super(
-      `Table already exists: ${namespace.join('.')}.${name}`,
-      CatalogErrorCode.ALREADY_EXISTS,
-      409
-    );
+  constructor(namespace: string[], name: string, context?: { forView?: boolean; renameFrom?: { namespace: string[]; name: string } }) {
+    let message: string;
+    if (context?.renameFrom) {
+      // Rename operation - include source identifier
+      message = `Cannot rename ${context.renameFrom.namespace.join('.')}.${context.renameFrom.name} to ${namespace.join('.')}.${name}. Table already exists`;
+    } else if (context?.forView) {
+      // Creating view but table exists - report as table conflict
+      message = `Table with same name already exists: ${namespace.join('.')}.${name}`;
+    } else {
+      // Default message
+      message = `Table already exists: ${namespace.join('.')}.${name}`;
+    }
+    super(message, CatalogErrorCode.ALREADY_EXISTS, 409);
     this.name = 'TableAlreadyExistsError';
   }
 }
@@ -114,12 +121,19 @@ export class ViewNotFoundError extends CatalogError {
 
 /** View already exists error */
 export class ViewAlreadyExistsError extends CatalogError {
-  constructor(namespace: string[], name: string) {
-    super(
-      `View already exists: ${namespace.join('.')}.${name}`,
-      CatalogErrorCode.ALREADY_EXISTS,
-      409
-    );
+  constructor(namespace: string[], name: string, context?: { forTable?: boolean; renameFrom?: { namespace: string[]; name: string } }) {
+    let message: string;
+    if (context?.renameFrom) {
+      // Rename operation - include source identifier
+      message = `Cannot rename ${context.renameFrom.namespace.join('.')}.${context.renameFrom.name} to ${namespace.join('.')}.${name}. View already exists`;
+    } else if (context?.forTable) {
+      // Creating table but view exists - report as view conflict
+      message = `View with same name already exists: ${namespace.join('.')}.${name}`;
+    } else {
+      // Default message
+      message = `View already exists: ${namespace.join('.')}.${name}`;
+    }
+    super(message, CatalogErrorCode.ALREADY_EXISTS, 409);
     this.name = 'ViewAlreadyExistsError';
   }
 }
@@ -752,7 +766,7 @@ export class CatalogDO extends DurableObject<Env> {
     // Check if a view with the same name already exists (cross-type conflict)
     const viewExists = await this.viewExists(namespace, name);
     if (viewExists) {
-      throw new ViewAlreadyExistsError(namespace, name);
+      throw new ViewAlreadyExistsError(namespace, name, { forTable: true });
     }
 
     const now = Date.now();
@@ -1009,7 +1023,7 @@ export class CatalogDO extends DurableObject<Env> {
       // Check if a view with the destination name already exists (cross-type conflict)
       const viewExists = await this.viewExists(toNamespace, toName);
       if (viewExists) {
-        throw new ViewAlreadyExistsError(toNamespace, toName);
+        throw new ViewAlreadyExistsError(toNamespace, toName, { renameFrom: { namespace: fromNamespace, name: fromName } });
       }
 
       const now = Date.now();
@@ -1087,7 +1101,7 @@ export class CatalogDO extends DurableObject<Env> {
     // Check if a table with the same name already exists (cross-type conflict)
     const tableExists = await this.tableExists(namespace, name);
     if (tableExists) {
-      throw new TableAlreadyExistsError(namespace, name);
+      throw new TableAlreadyExistsError(namespace, name, { forView: true });
     }
 
     const now = Date.now();
@@ -1263,13 +1277,13 @@ export class CatalogDO extends DurableObject<Env> {
       // Check destination view doesn't exist
       const destExists = await this.viewExists(destNamespace, destName);
       if (destExists) {
-        throw new ViewAlreadyExistsError(destNamespace, destName);
+        throw new ViewAlreadyExistsError(destNamespace, destName, { renameFrom: { namespace: sourceNamespace, name: sourceName } });
       }
 
       // Check if a table with the destination name already exists (cross-type conflict)
       const tableExists = await this.tableExists(destNamespace, destName);
       if (tableExists) {
-        throw new TableAlreadyExistsError(destNamespace, destName);
+        throw new TableAlreadyExistsError(destNamespace, destName, { renameFrom: { namespace: sourceNamespace, name: sourceName } });
       }
 
       const now = Date.now();
