@@ -1410,18 +1410,51 @@ function getConflictingRequirements(
     }
   });
 
-  // Sort conflicts to prioritize specific requirement types for better error messages.
-  // For schema conflicts, 'assert-current-schema-id' should come before 'assert-last-assigned-field-id'
-  // because "current schema changed" is more semantically accurate than "last assigned field id changed".
+  // Return conflicts in order - the first conflict in the list is the most specific error.
+  // Don't sort - preserve the order that requirements were checked, which matches
+  // what Iceberg clients expect. Critical requirements (uuid, create) are checked first.
+  //
+  // For update conflicts, if ONLY the assignment ID changed (field-id, partition-id)
+  // but not the corresponding schema/spec ID, prioritize the assignment message.
+  // This handles the distinction between schema conflicts vs field assignment conflicts.
+
+  // Check if we should prioritize assignment-based messages
+  const hasSchemaIdConflict = conflicts.some(c => c.type === 'assert-current-schema-id');
+  const hasFieldIdConflict = conflicts.some(c => c.type === 'assert-last-assigned-field-id');
+  const hasSpecIdConflict = conflicts.some(c => c.type === 'assert-default-spec-id');
+  const hasPartitionIdConflict = conflicts.some(c => c.type === 'assert-last-assigned-partition-id');
+
+  // If both schema-id and field-id conflicts exist, check which is more specific based on updates
+  // - If only add-schema without set-current-schema, it's an assignment conflict
+  // - If set-current-schema is present, it's a schema conflict
+  const hasSetCurrentSchema = updates.some(u => u.action === 'set-current-schema');
+  const hasSetDefaultSpec = updates.some(u => u.action === 'set-default-spec');
+
+  // Build priority based on update context
   const priorityOrder: Record<string, number> = {
     'assert-table-uuid': 0,
     'assert-create': 1,
-    'assert-current-schema-id': 2,
-    'assert-last-assigned-field-id': 3,
-    'assert-default-spec-id': 4,
-    'assert-last-assigned-partition-id': 5,
-    'assert-default-sort-order-id': 6,
   };
+
+  // Schema-related: if set-current-schema is in updates, prioritize schema-id; otherwise field-id
+  if (hasSetCurrentSchema) {
+    priorityOrder['assert-current-schema-id'] = 2;
+    priorityOrder['assert-last-assigned-field-id'] = 3;
+  } else {
+    priorityOrder['assert-last-assigned-field-id'] = 2;
+    priorityOrder['assert-current-schema-id'] = 3;
+  }
+
+  // Partition-related: if set-default-spec is in updates, prioritize spec-id; otherwise partition-id
+  if (hasSetDefaultSpec) {
+    priorityOrder['assert-default-spec-id'] = 4;
+    priorityOrder['assert-last-assigned-partition-id'] = 5;
+  } else {
+    priorityOrder['assert-last-assigned-partition-id'] = 4;
+    priorityOrder['assert-default-spec-id'] = 5;
+  }
+
+  priorityOrder['assert-default-sort-order-id'] = 6;
 
   return conflicts.sort((a, b) => {
     const priorityA = priorityOrder[a.type] ?? 100;
