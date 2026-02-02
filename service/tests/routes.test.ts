@@ -534,6 +534,14 @@ describe('Iceberg REST Catalog Routes', () => {
         const data = await res.json();
         expect(data.namespaces).toEqual([]);
       });
+
+      it('should return 404 when parent namespace does not exist (testListNonExistingNamespace)', async () => {
+        const res = await request('GET', '/v1/namespaces?parent=nonexistent');
+        expect(res.status).toBe(404);
+        const data = await res.json();
+        expect(data.error.type).toBe('NoSuchNamespaceException');
+        expect(data.error.message).toContain('Namespace does not exist: nonexistent');
+      });
     });
 
     describe('POST /v1/namespaces', () => {
@@ -2339,7 +2347,7 @@ describe('Iceberg REST Catalog Routes', () => {
         const res = await request('POST', '/v1/namespaces/view_db/views', req);
         expect(res.status).toBe(400);
         const data = await res.json();
-        expect(data.error.message).toContain('Cannot add multiple queries for dialect spark');
+        expect(data.error.message).toContain('Invalid view version: Cannot add multiple queries for dialect spark');
         expect(data.error.type).toBe('IllegalArgumentException');
       });
 

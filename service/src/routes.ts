@@ -1661,6 +1661,20 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       if (parentParam) {
         // Return only direct children of the specified parent
         const parent = parseNamespace(parentParam);
+
+        // Check if parent namespace exists - per Iceberg spec, should return 404 if not
+        const parentCheckResponse = await catalog.fetch(
+          new Request(`http://internal/namespaces/${encodeURIComponent(parent.join('\x1f'))}`)
+        );
+        if (!parentCheckResponse.ok) {
+          return icebergError(
+            c,
+            `Namespace does not exist: ${parent.join('.')}`,
+            'NoSuchNamespaceException',
+            404
+          );
+        }
+
         namespaces = namespaces.filter(ns => {
           // Direct children have exactly one more level than the parent
           if (ns.length !== parent.length + 1) return false;
@@ -2749,7 +2763,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           if (dialects.has(rep.dialect)) {
             return icebergError(
               c,
-              `Cannot add multiple queries for dialect ${rep.dialect}`,
+              `Invalid view version: Cannot add multiple queries for dialect ${rep.dialect}`,
               'IllegalArgumentException',
               400
             );
@@ -2993,7 +3007,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
                 const dialects = new Set<string>();
                 for (const rep of inputVersion.representations) {
                   if (dialects.has(rep.dialect)) {
-                    throw new Error(`Cannot add multiple queries for dialect ${rep.dialect}`);
+                    throw new Error(`Invalid view version: Cannot add multiple queries for dialect ${rep.dialect}`);
                   }
                   dialects.add(rep.dialect);
                 }
