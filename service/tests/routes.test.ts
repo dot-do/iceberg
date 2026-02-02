@@ -45,11 +45,16 @@ const mockTables = new Map<string, {
   properties: Record<string, string>;
   version: number;
 }>();
+const mockViews = new Map<string, {
+  metadata: unknown;
+  version: number;
+}>();
 
 // Reset mock storage
 function resetMockStorage(): void {
   mockNamespaces.clear();
   mockTables.clear();
+  mockViews.clear();
 }
 
 // Mock DO fetch handler
@@ -258,6 +263,89 @@ async function mockDOFetch(request: Request): Promise<Response> {
       }
       mockTables.delete(fromKey);
       mockTables.set(toKey, table);
+      return new Response(null, { status: 204 });
+    }
+
+    // =========================================================================
+    // View Operations
+    // =========================================================================
+
+    // GET /namespaces/{namespace}/views
+    const listViewsMatch = path.match(/^\/namespaces\/([^/]+)\/views$/);
+    if (method === 'GET' && listViewsMatch) {
+      const namespaceKey = decodeURIComponent(listViewsMatch[1]);
+      if (!mockNamespaces.has(namespaceKey)) {
+        return Response.json({ error: 'Namespace does not exist' }, { status: 404 });
+      }
+      const views: Array<{ namespace: string[]; name: string }> = [];
+      for (const viewKey of mockViews.keys()) {
+        const [ns, name] = viewKey.split('\x1f\x00');
+        if (ns === namespaceKey) {
+          views.push({ namespace: ns.split('\x1f'), name });
+        }
+      }
+      return Response.json({ views });
+    }
+
+    // POST /namespaces/{namespace}/views
+    const createViewMatch = path.match(/^\/namespaces\/([^/]+)\/views$/);
+    if (method === 'POST' && createViewMatch) {
+      const namespaceKey = decodeURIComponent(createViewMatch[1]);
+      if (!mockNamespaces.has(namespaceKey)) {
+        return Response.json({ error: 'Namespace does not exist' }, { status: 404 });
+      }
+      const body = await request.json() as { name: string; metadata?: unknown };
+      const viewKey = namespaceKey + '\x1f\x00' + body.name;
+      // Check for table with same name (cross-type conflict)
+      const tableKey = namespaceKey + '\x1f\x00' + body.name;
+      if (mockTables.has(tableKey)) {
+        return Response.json({ error: 'Table already exists with same name' }, { status: 409 });
+      }
+      if (mockViews.has(viewKey)) {
+        return Response.json({ error: 'View already exists' }, { status: 409 });
+      }
+      mockViews.set(viewKey, {
+        metadata: body.metadata,
+        version: 1,
+      });
+      return Response.json({ created: true });
+    }
+
+    // GET /namespaces/{namespace}/views/{view}
+    const getViewMatch = path.match(/^\/namespaces\/([^/]+)\/views\/([^/]+)$/);
+    if (method === 'GET' && getViewMatch) {
+      const namespaceKey = decodeURIComponent(getViewMatch[1]);
+      const viewName = decodeURIComponent(getViewMatch[2]);
+      const viewKey = namespaceKey + '\x1f\x00' + viewName;
+      const view = mockViews.get(viewKey);
+      if (!view) {
+        return Response.json({ error: 'View does not exist' }, { status: 404 });
+      }
+      return Response.json({ metadata: view.metadata, version: view.version });
+    }
+
+    // HEAD /namespaces/{namespace}/views/{view}
+    const headViewMatch = path.match(/^\/namespaces\/([^/]+)\/views\/([^/]+)$/);
+    if (method === 'HEAD' && headViewMatch) {
+      const namespaceKey = decodeURIComponent(headViewMatch[1]);
+      const viewName = decodeURIComponent(headViewMatch[2]);
+      const viewKey = namespaceKey + '\x1f\x00' + viewName;
+      if (mockViews.has(viewKey)) {
+        return new Response(null, { status: 200 });
+      }
+      return new Response(null, { status: 404 });
+    }
+
+    // DELETE /namespaces/{namespace}/views/{view}
+    const deleteViewMatch = path.match(/^\/namespaces\/([^/]+)\/views\/([^/]+)$/);
+    if (method === 'DELETE' && deleteViewMatch) {
+      const namespaceKey = decodeURIComponent(deleteViewMatch[1]);
+      const viewName = decodeURIComponent(deleteViewMatch[2]);
+      const viewKey = namespaceKey + '\x1f\x00' + viewName;
+      if (!mockViews.has(viewKey)) {
+        return Response.json({ error: 'View does not exist' }, { status: 404 });
+      }
+      mockViews.delete(viewKey);
       return new Response(null, { status: 204 });
     }
 
@@ -1189,6 +1277,438 @@ describe('Iceberg REST Catalog Routes', () => {
         }
       });
     });
+
+    describe('Remove Unused Schemas and Partition Specs', () => {
+      it('should remove unused schemas (testRemoveUnusedSchemas)', async () => {
+        // Create table with initial schema
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'remove_schema_test',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+        expect(createRes.status).toBe(200);
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+
+        // Add a new schema (schema-id 1)
+        const addSchemaRes = await request('POST', '/v1/namespaces/test_db/tables/remove_schema_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            {
+              action: 'add-schema',
+              schema: {
+                type: 'struct',
+                'schema-id': 1,
+                fields: [
+                  { id: 1, name: 'id', required: true, type: 'long' },
+                  { id: 2, name: 'name', required: false, type: 'string' },
+                ],
+              },
+            },
+          ],
+        });
+        expect(addSchemaRes.status).toBe(200);
+        const addSchemaData = await addSchemaRes.json();
+        expect(addSchemaData.metadata.schemas).toHaveLength(2);
+
+        // Remove the unused schema (schema-id 1, not referenced by any snapshot)
+        const removeRes = await request('POST', '/v1/namespaces/test_db/tables/remove_schema_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            { action: 'remove-schemas', 'schema-ids': [1] },
+          ],
+        });
+        expect(removeRes.status).toBe(200);
+        const removeData = await removeRes.json();
+        expect(removeData.metadata.schemas).toHaveLength(1);
+        expect(removeData.metadata.schemas[0]['schema-id']).toBe(0);
+      });
+
+      it('should not allow removing current schema', async () => {
+        // Create table with initial schema
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'remove_current_schema_test',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+        expect(createRes.status).toBe(200);
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+
+        // Try to remove the current schema (should fail)
+        const removeRes = await request('POST', '/v1/namespaces/test_db/tables/remove_current_schema_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            { action: 'remove-schemas', 'schema-ids': [0] },
+          ],
+        });
+        expect(removeRes.status).toBe(500);
+        const removeData = await removeRes.json();
+        expect(removeData.error.message).toContain('Cannot remove current schema');
+      });
+
+      it('should remove unused partition specs (testRemoveUnusedSpec)', async () => {
+        // Create table with initial partition spec
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'remove_spec_test',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+              { id: 2, name: 'category', required: false, type: 'string' },
+            ],
+          },
+          'partition-spec': {
+            'spec-id': 0,
+            fields: [],
+          },
+        });
+        expect(createRes.status).toBe(200);
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+
+        // Add a new partition spec (spec-id 1)
+        const addSpecRes = await request('POST', '/v1/namespaces/test_db/tables/remove_spec_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            {
+              action: 'add-spec',
+              spec: {
+                'spec-id': 1,
+                fields: [
+                  { 'source-id': 2, 'field-id': 1000, name: 'category_partition', transform: 'identity' },
+                ],
+              },
+            },
+          ],
+        });
+        expect(addSpecRes.status).toBe(200);
+        const addSpecData = await addSpecRes.json();
+        expect(addSpecData.metadata['partition-specs']).toHaveLength(2);
+
+        // Remove the unused partition spec (spec-id 1)
+        const removeRes = await request('POST', '/v1/namespaces/test_db/tables/remove_spec_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            { action: 'remove-partition-specs', 'spec-ids': [1] },
+          ],
+        });
+        expect(removeRes.status).toBe(200);
+        const removeData = await removeRes.json();
+        expect(removeData.metadata['partition-specs']).toHaveLength(1);
+        expect(removeData.metadata['partition-specs'][0]['spec-id']).toBe(0);
+      });
+
+      it('should not allow removing default partition spec', async () => {
+        // Create table with initial partition spec
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'remove_default_spec_test',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+        expect(createRes.status).toBe(200);
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+
+        // Try to remove the default partition spec (should fail)
+        const removeRes = await request('POST', '/v1/namespaces/test_db/tables/remove_default_spec_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            { action: 'remove-partition-specs', 'spec-ids': [0] },
+          ],
+        });
+        expect(removeRes.status).toBe(500);
+        const removeData = await removeRes.json();
+        expect(removeData.error.message).toContain('Cannot remove default partition spec');
+      });
+    });
+
+    describe('Transaction Commits', () => {
+      it('should create table via staged transaction (createTableTransaction)', async () => {
+        // Step 1: Stage table creation (stage-create=true in body per Iceberg REST spec)
+        const stageRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'staged_table',
+          'stage-create': true,
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+              { id: 2, name: 'data', required: false, type: 'string' },
+            ],
+          },
+        });
+        expect(stageRes.status).toBe(200);
+        const stageData = await stageRes.json();
+
+        // Verify staged response contains metadata-location and metadata
+        expect(stageData['metadata-location']).toBeDefined();
+        expect(stageData.metadata).toBeDefined();
+        expect(stageData.metadata['table-uuid']).toBeDefined();
+
+        // Verify table is NOT yet created in the catalog
+        const checkRes = await request('HEAD', '/v1/namespaces/test_db/tables/staged_table');
+        expect(checkRes.status).toBe(404);
+
+        // Step 2: Commit the staged table with assert-create requirement
+        const commitRes = await request('POST', '/v1/namespaces/test_db/tables/staged_table', {
+          requirements: [
+            { type: 'assert-create' },
+          ],
+          updates: [
+            { action: 'assign-uuid', uuid: stageData.metadata['table-uuid'] },
+            { action: 'set-location', location: stageData.metadata.location },
+            { action: 'add-schema', schema: stageData.metadata.schemas[0], 'last-column-id': 2 },
+            { action: 'set-current-schema', 'schema-id': 0 },
+            { action: 'add-spec', spec: { 'spec-id': 0, fields: [] } },
+            { action: 'set-default-spec', 'spec-id': 0 },
+            { action: 'add-sort-order', 'sort-order': { 'order-id': 0, fields: [] } },
+            { action: 'set-default-sort-order', 'sort-order-id': 0 },
+          ],
+        });
+        expect(commitRes.status).toBe(200);
+        const commitData = await commitRes.json();
+        expect(commitData.metadata['table-uuid']).toBe(stageData.metadata['table-uuid']);
+        expect(commitData.metadata.schemas).toHaveLength(1);
+
+        // Verify table now exists
+        const verifyRes = await request('HEAD', '/v1/namespaces/test_db/tables/staged_table');
+        expect(verifyRes.status).toBe(204);
+      });
+
+      it('should reject create transaction when table already exists', async () => {
+        // Create a table first
+        await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'existing_for_create',
+          schema: {
+            type: 'struct',
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+
+        // Try to commit with assert-create - should fail
+        const res = await request('POST', '/v1/namespaces/test_db/tables/existing_for_create', {
+          requirements: [
+            { type: 'assert-create' },
+          ],
+          updates: [
+            { action: 'assign-uuid', uuid: crypto.randomUUID() },
+            { action: 'add-schema', schema: { type: 'struct', 'schema-id': 0, fields: [] } },
+            { action: 'set-current-schema', 'schema-id': 0 },
+          ],
+        });
+        expect(res.status).toBe(409);
+        const data = await res.json();
+        expect(data.error.message).toContain('already exists');
+      });
+
+      it('should replace table via transaction (replaceTransaction)', async () => {
+        // Create initial table
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'replace_target',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [{ id: 1, name: 'old_field', required: true, type: 'long' }],
+          },
+        });
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+
+        // Replace table with new schema
+        const replaceRes = await request('POST', '/v1/namespaces/test_db/tables/replace_target', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            {
+              action: 'add-schema',
+              schema: {
+                type: 'struct',
+                'schema-id': 1,
+                fields: [
+                  { id: 1, name: 'new_field', required: true, type: 'string' },
+                  { id: 2, name: 'another_field', required: false, type: 'int' },
+                ],
+              },
+            },
+            { action: 'set-current-schema', 'schema-id': 1 },
+          ],
+        });
+        expect(replaceRes.status).toBe(200);
+        const replaceData = await replaceRes.json();
+
+        // Verify the replacement
+        expect(replaceData.metadata['table-uuid']).toBe(tableUuid); // UUID preserved
+        expect(replaceData.metadata.schemas).toHaveLength(2); // Old and new schemas
+        expect(replaceData.metadata['current-schema-id']).toBe(1);
+      });
+
+      it('should reject replace when table UUID does not match', async () => {
+        // Create initial table
+        await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'uuid_check_table',
+          schema: {
+            type: 'struct',
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+
+        // Try to replace with wrong UUID
+        const res = await request('POST', '/v1/namespaces/test_db/tables/uuid_check_table', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: '00000000-0000-0000-0000-000000000000' },
+          ],
+          updates: [
+            { action: 'set-properties', updates: { test: 'value' } },
+          ],
+        });
+        expect(res.status).toBe(409);
+        const data = await res.json();
+        expect(data.error.message).toContain('UUID does not match');
+      });
+
+      it('should return 404 when creating table in non-existent namespace', async () => {
+        // Try to commit assert-create in a namespace that doesn't exist
+        const res = await request('POST', '/v1/namespaces/nonexistent_ns/tables/new_table', {
+          requirements: [
+            { type: 'assert-create' },
+          ],
+          updates: [
+            { action: 'assign-uuid', uuid: crypto.randomUUID() },
+            { action: 'set-location', location: 's3://iceberg-tables/nonexistent_ns/new_table' },
+            { action: 'add-schema', schema: { type: 'struct', 'schema-id': 0, fields: [] } },
+            { action: 'set-current-schema', 'schema-id': 0 },
+          ],
+        });
+        expect(res.status).toBe(404);
+        const data = await res.json();
+        expect(data.error.type).toBe('NoSuchNamespaceException');
+      });
+
+      it('should handle createOrReplace when table does not exist (create path)', async () => {
+        // Simulate Java client createOrReplaceTransaction when table doesn't exist:
+        // 1. Try to load table (GET) - expect 404
+        // 2. Stage create (POST with stage-create=true)
+        // 3. Commit with assert-create
+
+        // Step 1: Verify table doesn't exist
+        const loadRes = await request('GET', '/v1/namespaces/test_db/tables/cor_create_test');
+        expect(loadRes.status).toBe(404);
+
+        // Step 2: Stage create
+        const stageRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'cor_create_test',
+          'stage-create': true,
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+        });
+        expect(stageRes.status).toBe(200);
+        const stageData = await stageRes.json();
+
+        // Step 3: Commit with assert-create
+        const commitRes = await request('POST', '/v1/namespaces/test_db/tables/cor_create_test', {
+          requirements: [
+            { type: 'assert-create' },
+          ],
+          updates: [
+            { action: 'assign-uuid', uuid: stageData.metadata['table-uuid'] },
+            { action: 'set-location', location: stageData.metadata.location },
+            { action: 'add-schema', schema: stageData.metadata.schemas[0], 'last-column-id': 1 },
+            { action: 'set-current-schema', 'schema-id': 0 },
+            { action: 'add-spec', spec: { 'spec-id': 0, fields: [] } },
+            { action: 'set-default-spec', 'spec-id': 0 },
+            { action: 'add-sort-order', 'sort-order': { 'order-id': 0, fields: [] } },
+            { action: 'set-default-sort-order', 'sort-order-id': 0 },
+          ],
+        });
+        expect(commitRes.status).toBe(200);
+
+        // Verify table exists
+        const verifyRes = await request('GET', '/v1/namespaces/test_db/tables/cor_create_test');
+        expect(verifyRes.status).toBe(200);
+      });
+
+      it('should handle createOrReplace when table exists (replace path)', async () => {
+        // Simulate Java client createOrReplaceTransaction when table exists:
+        // 1. Try to load table (GET) - table exists
+        // 2. Commit with assert-table-uuid (replace)
+
+        // Step 1: Create the table first
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'cor_replace_test',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [
+              { id: 1, name: 'old_id', required: true, type: 'long' },
+            ],
+          },
+        });
+        expect(createRes.status).toBe(200);
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+
+        // Step 2: Load table (this is what Java client does first)
+        const loadRes = await request('GET', '/v1/namespaces/test_db/tables/cor_replace_test');
+        expect(loadRes.status).toBe(200);
+
+        // Step 3: Replace with new schema
+        const replaceRes = await request('POST', '/v1/namespaces/test_db/tables/cor_replace_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            {
+              action: 'add-schema',
+              schema: {
+                type: 'struct',
+                'schema-id': 1,
+                fields: [
+                  { id: 1, name: 'new_id', required: true, type: 'string' },
+                  { id: 2, name: 'extra', required: false, type: 'int' },
+                ],
+              },
+            },
+            { action: 'set-current-schema', 'schema-id': 1 },
+          ],
+        });
+        expect(replaceRes.status).toBe(200);
+        const replaceData = await replaceRes.json();
+
+        // Verify table was replaced (UUID preserved, new schema)
+        expect(replaceData.metadata['table-uuid']).toBe(tableUuid);
+        expect(replaceData.metadata.schemas).toHaveLength(2);
+        expect(replaceData.metadata['current-schema-id']).toBe(1);
+      });
+    });
   });
 
   // =========================================================================
@@ -1459,6 +1979,308 @@ describe('Iceberg REST Catalog Routes', () => {
       expect(res.status).toBe(404);
       const data = await res.json();
       expect(data.error.type).toBe('NoSuchNamespaceException');
+    });
+  });
+
+  // =========================================================================
+  // Load Table with Missing Metadata File (testLoadTableWithMissingMetadataFile)
+  // =========================================================================
+  describe('Load table with missing metadata file', () => {
+    let appWithR2: Hono<{ Bindings: MockEnv; Variables: MockVariables }>;
+    let envWithR2: MockEnv;
+
+    // Mock R2 storage for metadata files - intentionally empty to simulate missing file
+    const mockR2StorageEmpty = new Map<string, unknown>();
+
+    function createMockR2BucketEmpty(): MockR2Bucket {
+      return {
+        put: async (key: string, value: string) => {
+          mockR2StorageEmpty.set(key, JSON.parse(value));
+        },
+        get: async () => {
+          // Always return null to simulate missing file
+          return null;
+        },
+        list: async () => {
+          return { objects: [] };
+        },
+        delete: async () => {
+          // Do nothing
+        },
+      };
+    }
+
+    // Custom mock DO fetch handler that simulates table without metadata stored
+    async function mockDOFetchWithoutMetadata(request: Request): Promise<Response> {
+      const url = new URL(request.url);
+      const path = url.pathname;
+      const method = request.method;
+
+      // GET /namespaces/{namespace}/tables/{table} - return table without metadata
+      const getTableMatch = path.match(/^\/namespaces\/([^/]+)\/tables\/([^/]+)$/);
+      if (method === 'GET' && getTableMatch) {
+        const namespaceKey = decodeURIComponent(getTableMatch[1]);
+        const tableName = decodeURIComponent(getTableMatch[2]);
+        if (namespaceKey === 'test_db' && tableName === 'table_missing_metadata') {
+          // Return table record but without metadata stored
+          return Response.json({
+            location: 's3://iceberg-tables/test_db/table_missing_metadata',
+            metadataLocation: 's3://iceberg-tables/test_db/table_missing_metadata/metadata/missing.metadata.json',
+            // No metadata field - simulating catalog entry pointing to non-existent file
+            properties: {},
+            version: 1,
+          });
+        }
+        return Response.json({ error: 'Table does not exist' }, { status: 404 });
+      }
+
+      // Namespace exists check
+      if (method === 'GET' && path === '/namespaces/test_db') {
+        return Response.json({ properties: {} });
+      }
+
+      // Fallback to default mock
+      return mockDOFetch(request);
+    }
+
+    beforeEach(async () => {
+      resetMockStorage();
+      mockR2StorageEmpty.clear();
+
+      envWithR2 = {
+        ...createMockEnv(),
+        R2_BUCKET: createMockR2BucketEmpty(),
+      };
+
+      appWithR2 = new Hono<{ Bindings: MockEnv; Variables: MockVariables }>();
+      appWithR2.use('/*', async (c, next) => {
+        c.set('catalogStub', { fetch: mockDOFetchWithoutMetadata });
+        c.set('auth', createMockAuthContext());
+        c.set('authorization', createMockAuthorizationContext());
+        return next();
+      });
+      appWithR2.route('/v1', createIcebergRoutes() as Hono<{ Bindings: MockEnv; Variables: MockVariables }>);
+
+      // Create namespace via mock
+      mockNamespaces.set('test_db', {});
+    });
+
+    async function requestWithR2(method: string, path: string, body?: unknown): Promise<Response> {
+      const req = new Request(`http://test${path}`, {
+        method,
+        headers: body ? { 'Content-Type': 'application/json' } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return appWithR2.fetch(req, envWithR2);
+    }
+
+    it('should return 404 when table exists in catalog but metadata file is missing', async () => {
+      // The mock DO returns a table entry pointing to a metadata file that doesn't exist in R2
+      const res = await requestWithR2('GET', '/v1/namespaces/test_db/tables/table_missing_metadata');
+
+      // Should return 404 with error message about missing metadata
+      expect(res.status).toBe(404);
+      const data = await res.json();
+      expect(data.error.type).toBe('NoSuchTableException');
+      expect(data.error.message).toContain('Unable to load metadata');
+    });
+  });
+
+  // =========================================================================
+  // View Operations
+  // =========================================================================
+  describe('View Operations', () => {
+    beforeEach(async () => {
+      // Create a namespace for view tests
+      await request('POST', '/v1/namespaces', { namespace: ['view_db'] });
+    });
+
+    describe('POST /v1/namespaces/{namespace}/views - Create view', () => {
+      const validViewRequest = {
+        name: 'test_view',
+        schema: {
+          type: 'struct',
+          fields: [
+            { id: 1, name: 'id', required: true, type: 'long' },
+          ],
+        },
+        'view-version': {
+          'version-id': 1,
+          'schema-id': 0,
+          'timestamp-ms': Date.now(),
+          summary: { operation: 'create' },
+          representations: [
+            { type: 'sql', sql: 'SELECT * FROM test_table', dialect: 'spark' },
+          ],
+        },
+      };
+
+      it('should create a view', async () => {
+        const res = await request('POST', '/v1/namespaces/view_db/views', validViewRequest);
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data['metadata-location']).toContain('test_view');
+        expect(data.metadata['format-version']).toBe(1);
+        expect(data.metadata['view-uuid']).toBeDefined();
+      });
+
+      it('should return 400 for missing name', async () => {
+        const req = { ...validViewRequest };
+        delete (req as { name?: string }).name;
+        const res = await request('POST', '/v1/namespaces/view_db/views', req);
+        expect(res.status).toBe(400);
+        const data = await res.json();
+        expect(data.error.message).toContain('View name is required');
+      });
+
+      it('should return 400 for missing schema', async () => {
+        const req = { ...validViewRequest };
+        delete (req as { schema?: unknown }).schema;
+        const res = await request('POST', '/v1/namespaces/view_db/views', req);
+        expect(res.status).toBe(400);
+        const data = await res.json();
+        expect(data.error.message).toContain('Schema is required');
+      });
+
+      it('should return 400 for missing view-version', async () => {
+        const req = { ...validViewRequest };
+        delete (req as { 'view-version'?: unknown })['view-version'];
+        const res = await request('POST', '/v1/namespaces/view_db/views', req);
+        expect(res.status).toBe(400);
+        const data = await res.json();
+        expect(data.error.message).toContain('View version is required');
+      });
+
+      it('should return 400 for missing representations', async () => {
+        const req = {
+          ...validViewRequest,
+          'view-version': {
+            ...validViewRequest['view-version'],
+            representations: [],
+          },
+        };
+        const res = await request('POST', '/v1/namespaces/view_db/views', req);
+        expect(res.status).toBe(400);
+        const data = await res.json();
+        expect(data.error.message).toContain('View version representations are required');
+      });
+
+      it('should return 400 for duplicate dialects', async () => {
+        const req = {
+          ...validViewRequest,
+          'view-version': {
+            ...validViewRequest['view-version'],
+            representations: [
+              { type: 'sql', sql: 'SELECT * FROM t1', dialect: 'spark' },
+              { type: 'sql', sql: 'SELECT * FROM t2', dialect: 'spark' },
+            ],
+          },
+        };
+        const res = await request('POST', '/v1/namespaces/view_db/views', req);
+        expect(res.status).toBe(400);
+        const data = await res.json();
+        expect(data.error.message).toContain('Cannot add multiple queries for dialect spark');
+      });
+
+      it('should return 404 for non-existent namespace', async () => {
+        const res = await request('POST', '/v1/namespaces/nonexistent/views', validViewRequest);
+        expect(res.status).toBe(404);
+        const data = await res.json();
+        expect(data.error.type).toBe('NoSuchNamespaceException');
+      });
+
+      it('should return 409 when view already exists', async () => {
+        // Create view first
+        await request('POST', '/v1/namespaces/view_db/views', validViewRequest);
+        // Try to create again
+        const res = await request('POST', '/v1/namespaces/view_db/views', validViewRequest);
+        expect(res.status).toBe(409);
+        const data = await res.json();
+        expect(data.error.type).toBe('AlreadyExistsException');
+      });
+
+      it('should return 409 when table with same name exists', async () => {
+        // Create table first
+        await request('POST', '/v1/namespaces/view_db/tables', {
+          name: 'test_view',
+          schema: { type: 'struct', fields: [] },
+        });
+        // Try to create view with same name
+        const res = await request('POST', '/v1/namespaces/view_db/views', validViewRequest);
+        expect(res.status).toBe(409);
+        const data = await res.json();
+        expect(data.error.type).toBe('AlreadyExistsException');
+        expect(data.error.message).toContain('Table with same name already exists');
+      });
+    });
+
+    describe('GET /v1/namespaces/{namespace}/views/{view}', () => {
+      const validViewRequest = {
+        name: 'existing_view',
+        schema: {
+          type: 'struct',
+          fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+        },
+        'view-version': {
+          'version-id': 1,
+          'schema-id': 0,
+          'timestamp-ms': Date.now(),
+          summary: { operation: 'create' },
+          representations: [
+            { type: 'sql', sql: 'SELECT * FROM test_table', dialect: 'spark' },
+          ],
+        },
+      };
+
+      it('should load an existing view', async () => {
+        // Create view first
+        await request('POST', '/v1/namespaces/view_db/views', validViewRequest);
+        // Load view
+        const res = await request('GET', '/v1/namespaces/view_db/views/existing_view');
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.metadata).toBeDefined();
+        expect(data['metadata-location']).toBeDefined();
+      });
+
+      it('should return 404 for non-existent view', async () => {
+        const res = await request('GET', '/v1/namespaces/view_db/views/nonexistent');
+        expect(res.status).toBe(404);
+        const data = await res.json();
+        expect(data.error.type).toBe('NoSuchViewException');
+      });
+    });
+
+    describe('HEAD /v1/namespaces/{namespace}/views/{view}', () => {
+      const validViewRequest = {
+        name: 'head_test_view',
+        schema: {
+          type: 'struct',
+          fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+        },
+        'view-version': {
+          'version-id': 1,
+          'schema-id': 0,
+          'timestamp-ms': Date.now(),
+          summary: { operation: 'create' },
+          representations: [
+            { type: 'sql', sql: 'SELECT * FROM test_table', dialect: 'spark' },
+          ],
+        },
+      };
+
+      it('should return 204 for existing view', async () => {
+        // Create view first
+        await request('POST', '/v1/namespaces/view_db/views', validViewRequest);
+        // Check view exists
+        const res = await request('HEAD', '/v1/namespaces/view_db/views/head_test_view');
+        expect(res.status).toBe(204);
+      });
+
+      it('should return 404 for non-existent view', async () => {
+        const res = await request('HEAD', '/v1/namespaces/view_db/views/nonexistent');
+        expect(res.status).toBe(404);
+      });
     });
   });
 });

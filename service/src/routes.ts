@@ -131,6 +131,12 @@ interface RegisterTableRequest {
   'metadata-location': string;
 }
 
+/** Request body for registering an existing view */
+interface RegisterViewRequest {
+  name: string;
+  'metadata-location': string;
+}
+
 /** Request body for updating namespace properties */
 interface UpdateNamespacePropertiesRequest {
   removals?: string[];
@@ -164,7 +170,9 @@ type TableUpdate =
   | { action: 'set-snapshot-ref'; 'ref-name': string; type: 'branch' | 'tag'; 'snapshot-id': number; 'max-ref-age-ms'?: number; 'max-snapshot-age-ms'?: number; 'min-snapshots-to-keep'?: number }
   | { action: 'set-properties'; updates: Record<string, string> }
   | { action: 'remove-properties'; removals: string[] }
-  | { action: 'set-location'; location: string };
+  | { action: 'set-location'; location: string }
+  | { action: 'remove-schemas'; 'schema-ids': number[] }
+  | { action: 'remove-partition-specs'; 'spec-ids': number[] };
 
 // Simplified types for table metadata
 interface IcebergSchema {
@@ -180,6 +188,8 @@ interface IcebergField {
   required: boolean;
   type: string | IcebergSchema | IcebergListType | IcebergMapType;
   doc?: string;
+  'initial-default'?: unknown;  // Default value for records written before this field was added
+  'write-default'?: unknown;    // Default value for records written after this field was added
 }
 
 interface IcebergListType {
@@ -383,6 +393,13 @@ function normalizeField(field: IcebergField, ctx: FieldIdContext): IcebergField 
   if (field.doc !== undefined) {
     copy.doc = field.doc;
   }
+  // Preserve default values per Iceberg spec
+  if (field['initial-default'] !== undefined) {
+    copy['initial-default'] = field['initial-default'];
+  }
+  if (field['write-default'] !== undefined) {
+    copy['write-default'] = field['write-default'];
+  }
   return copy;
 }
 
@@ -542,6 +559,13 @@ function reassignFieldWithMapping(field: IcebergField, ctx: FieldIdContext, idMa
   if (field.doc !== undefined) {
     copy.doc = field.doc;
   }
+  // Preserve default values per Iceberg spec
+  if (field['initial-default'] !== undefined) {
+    copy['initial-default'] = field['initial-default'];
+  }
+  if (field['write-default'] !== undefined) {
+    copy['write-default'] = field['write-default'];
+  }
   return copy;
 }
 
@@ -688,6 +712,13 @@ function reassignField(field: IcebergField, ctx: FieldIdContext): IcebergField {
   };
   if (field.doc !== undefined) {
     copy.doc = field.doc;
+  }
+  // Preserve default values per Iceberg spec
+  if (field['initial-default'] !== undefined) {
+    copy['initial-default'] = field['initial-default'];
+  }
+  if (field['write-default'] !== undefined) {
+    copy['write-default'] = field['write-default'];
   }
   return copy;
 }
@@ -1138,6 +1169,11 @@ function applyUpdates(
       case 'remove-snapshot-ref': {
         const { [update['ref-name']]: _, ...remainingRefs } = result.refs ?? {};
         result.refs = remainingRefs;
+        // When removing the 'main' ref, reset current-snapshot-id
+        // Note: snapshot-log is preserved per Iceberg spec (cleaned only during expire_snapshots)
+        if (update['ref-name'] === 'main') {
+          delete result['current-snapshot-id'];
+        }
         break;
       }
 
@@ -1161,6 +1197,66 @@ function applyUpdates(
       case 'set-location':
         result.location = update.location;
         break;
+
+      case 'remove-schemas': {
+        const schemaIdsToRemove = update['schema-ids'];
+
+        // Cannot remove the current schema
+        if (schemaIdsToRemove.includes(result['current-schema-id'])) {
+          throw new Error(`Cannot remove current schema with id ${result['current-schema-id']}`);
+        }
+
+        // Get schemas that are referenced by snapshots
+        // (collect snapshot IDs being removed in this same request to exclude from check)
+        const snapshotIdsBeingRemoved = new Set<number>();
+        for (const u of updates) {
+          if (u.action === 'remove-snapshots') {
+            for (const snapId of u['snapshot-ids']) {
+              snapshotIdsBeingRemoved.add(snapId);
+            }
+          }
+        }
+
+        // Check which schemas are still referenced by remaining snapshots
+        const schemasReferencedBySnapshots = new Set<number>();
+        for (const snapshot of result.snapshots ?? []) {
+          // Skip snapshots that are being removed in this same request
+          if (snapshotIdsBeingRemoved.has(snapshot['snapshot-id'])) {
+            continue;
+          }
+          if (snapshot['schema-id'] !== undefined) {
+            schemasReferencedBySnapshots.add(snapshot['schema-id']);
+          }
+        }
+
+        // Check if any schema to remove is still referenced
+        for (const schemaId of schemaIdsToRemove) {
+          if (schemasReferencedBySnapshots.has(schemaId)) {
+            throw new Error(`Cannot remove schema with id ${schemaId} because it is referenced by a snapshot`);
+          }
+        }
+
+        // Remove the schemas
+        result.schemas = result.schemas.filter(
+          s => !schemaIdsToRemove.includes(s['schema-id'] ?? -1)
+        );
+        break;
+      }
+
+      case 'remove-partition-specs': {
+        const specIdsToRemove = update['spec-ids'];
+
+        // Cannot remove the default partition spec
+        if (specIdsToRemove.includes(result['default-spec-id'])) {
+          throw new Error(`Cannot remove default partition spec with id ${result['default-spec-id']}`);
+        }
+
+        // Remove the partition specs
+        result['partition-specs'] = (result['partition-specs'] ?? []).filter(
+          s => !specIdsToRemove.includes(s['spec-id'])
+        );
+        break;
+      }
     }
   }
 
@@ -1445,6 +1541,7 @@ function validateRequirements(
  * - POST /namespaces/{namespace}/views/{view} - Replace view
  * - DELETE /namespaces/{namespace}/views/{view} - Drop view
  * - POST /views/rename - Rename view
+ * - POST /namespaces/{namespace}/register-view - Register existing view
  */
 export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextVariables }> {
   const api = new Hono<{ Bindings: Env; Variables: ContextVariables }>();
@@ -1514,6 +1611,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         'POST /v1/{prefix}/namespaces/{namespace}/views/{view}',
         'DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}',
         'POST /v1/{prefix}/views/rename',
+        'POST /v1/{prefix}/namespaces/{namespace}/register-view',
       ],
     };
 
@@ -1979,24 +2077,14 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         }
       }
 
-      // Return minimal metadata if we can't find the full metadata
-      return c.json({
-        'metadata-location': data.metadataLocation,
-        metadata: {
-          'format-version': 2,
-          'table-uuid': crypto.randomUUID(),
-          location: data.location,
-          'last-updated-ms': Date.now(),
-          'last-column-id': 0,
-          'current-schema-id': 0,
-          schemas: [],
-          'default-spec-id': 0,
-          'partition-specs': [{ 'spec-id': 0, fields: [] }],
-          'last-partition-id': 999,
-          'default-sort-order-id': 0,
-          'sort-orders': [{ 'order-id': 0, fields: [] }],
-        },
-      });
+      // Metadata file not found - return error per Iceberg spec
+      // This supports testLoadTableWithMissingMetadataFile RCK test
+      return icebergError(
+        c,
+        `Unable to load metadata at location: ${data.metadataLocation}`,
+        'NoSuchTableException',
+        404
+      );
     } catch (error) {
       if (c.req.method === 'HEAD') {
         return c.body(null, 500);
@@ -2454,6 +2542,35 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         }
       }
 
+      // Fallback: Try converting S3 URLs to HTTPS using the configured endpoint
+      // This supports RCK tests that use S3 URLs with external buckets
+      if (!metadata && metadataLocation.startsWith('s3://') && c.env.R2_URL) {
+        // Parse S3 URL: s3://bucket-name/path/to/file
+        const s3Match = metadataLocation.match(/^s3:\/\/([^/]+)\/(.+)$/);
+        if (s3Match) {
+          const [, bucket, key] = s3Match;
+          // Convert to HTTPS URL using S3 endpoint
+          // R2_URL is like https://accountid.r2.cloudflarestorage.com
+          // We need: https://accountid.r2.cloudflarestorage.com/bucket/key
+          const httpsUrl = `${c.env.R2_URL}/${bucket}/${key}`;
+          try {
+            const response = await fetch(httpsUrl, {
+              headers: c.env.R2_ACCESS_KEY_ID && c.env.R2_SECRET_ACCESS_KEY
+                ? {
+                    // Basic auth or signed requests would go here
+                    // For now, rely on public bucket or presigned URL
+                  }
+                : {},
+            });
+            if (response.ok) {
+              metadata = await response.json() as TableMetadata;
+            }
+          } catch {
+            // S3 fetch failed, will try HTTP fallback below
+          }
+        }
+      }
+
       // Fallback: Try HTTP/HTTPS fetch for external URLs
       // This supports RCK tests with external S3 or presigned URLs
       if (!metadata && (metadataLocation.startsWith('http://') || metadataLocation.startsWith('https://'))) {
@@ -2601,6 +2718,11 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         return icebergError(c, 'View version is required', 'BadRequestException', 400);
       }
 
+      // Validate representations - required per Iceberg spec
+      if (!body['view-version'].representations || body['view-version'].representations.length === 0) {
+        return icebergError(c, 'View version representations are required', 'BadRequestException', 400);
+      }
+
       // Validate representations - no duplicate dialects allowed
       if (body['view-version'].representations) {
         const dialects = new Set<string>();
@@ -2620,9 +2742,10 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       // Generate view UUID
       const viewUuid = crypto.randomUUID();
 
-      // Determine view location
+      // Determine view location - check both body.location and properties.location
       const warehousePrefix = c.env.R2_BUCKET ? 's3://iceberg-tables' : 'file:///warehouse';
-      const viewLocation = body.location ?? `${warehousePrefix}/${namespace.join('/')}/views/${body.name}`;
+      const customLocation = body.location ?? body.properties?.location;
+      const viewLocation = customLocation ?? `${warehousePrefix}/${namespace.join('/')}/views/${body.name}`;
 
       // For views, preserve field IDs from the request (since they reference table schemas)
       // Only set schema-id to 0 for the initial view schema, per Iceberg spec
@@ -3082,6 +3205,116 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to rename view',
+        'ServiceFailureException',
+        500
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /namespaces/{namespace}/register-view - Register existing view
+  // -------------------------------------------------------------------------
+  api.post('/namespaces/:namespace/register-view', requireTablePermission('table:create'), async (c) => {
+    try {
+      const namespaceParam = c.req.param('namespace');
+      const namespace = parseNamespace(namespaceParam);
+      const body = await c.req.json() as RegisterViewRequest;
+
+      if (!body.name) {
+        return icebergError(c, 'View name is required', 'BadRequestException', 400);
+      }
+
+      if (!body['metadata-location']) {
+        return icebergError(c, 'Metadata location is required', 'BadRequestException', 400);
+      }
+
+      const metadataLocation = body['metadata-location'];
+
+      // Load metadata from the provided location
+      // Try R2 first if the path matches our R2 bucket, otherwise try HTTP/HTTPS
+      let metadata: ViewMetadata | null = null;
+
+      // Try R2 bucket if available and path starts with our S3 prefix
+      if (c.env.R2_BUCKET && metadataLocation.startsWith('s3://iceberg-tables/')) {
+        const metadataPath = metadataLocation.replace('s3://iceberg-tables/', '');
+        const object = await c.env.R2_BUCKET.get(metadataPath);
+        if (object) {
+          metadata = await object.json() as ViewMetadata;
+        }
+      }
+
+      // Fallback: Try HTTP/HTTPS fetch for external URLs
+      if (!metadata && (metadataLocation.startsWith('http://') || metadataLocation.startsWith('https://'))) {
+        try {
+          const response = await fetch(metadataLocation);
+          if (response.ok) {
+            metadata = await response.json() as ViewMetadata;
+          }
+        } catch {
+          // HTTP fetch failed, will return error below
+        }
+      }
+
+      if (!metadata) {
+        return icebergError(
+          c,
+          `Unable to load metadata from location: ${metadataLocation}`,
+          'BadRequestException',
+          400
+        );
+      }
+
+      const catalog = getCatalogStub(c);
+
+      // Check if a table with the same name exists (cross-type conflict) before registering
+      const tableCheckResponse = await catalog.fetch(
+        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables/${encodeURIComponent(body.name)}`, {
+          method: 'HEAD',
+        })
+      );
+
+      if (tableCheckResponse.ok) {
+        return icebergError(c, `Table with same name already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+      }
+
+      // Store view in catalog
+      const response = await catalog.fetch(
+        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/views`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: body.name,
+            metadata: metadata,
+          }),
+        })
+      );
+
+      if (!response.ok) {
+        const error = await response.json() as { error: string };
+        // Check for cross-type conflict (table exists with same name)
+        if (error.error?.includes('Table already exists') || error.error?.includes('Table with same name')) {
+          return icebergError(c, `Table with same name already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+        }
+        // Check for view already exists
+        if (response.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('View already exists')) {
+          return icebergError(c, `View already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+        }
+        if (response.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
+          return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
+        }
+        throw new Error(error.error || 'Failed to register view');
+      }
+
+      // Return LoadViewResponse format with the metadata
+      return c.json({
+        'metadata-location': metadataLocation,
+        metadata: metadata,
+      });
+    } catch (error) {
+      if (error instanceof Response) throw error;
+      return icebergError(
+        c,
+        error instanceof Error ? error.message : 'Failed to register view',
         'ServiceFailureException',
         500
       );
