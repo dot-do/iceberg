@@ -83,9 +83,22 @@ app.use('/*', cors());
 app.use('/*', async (c, next) => {
   const backendType = c.env.CATALOG_BACKEND ?? 'durable-object';
 
-  // Extract warehouse from query parameter or header for catalog isolation
-  // Per Iceberg REST spec, warehouse is passed as query param to /v1/config
-  const warehouse = c.req.query('warehouse') || c.req.header('X-Iceberg-Warehouse') || 'default';
+  // Extract warehouse from multiple sources (in priority order):
+  // 1. URL path prefix: /v1/ws/{warehouse}/... (returned by /v1/config as prefix)
+  // 2. Query parameter: ?warehouse=xxx (used in /v1/config calls)
+  // 3. Header: X-Iceberg-Warehouse (custom extension)
+  // 4. Default: 'default'
+  let warehouse = 'default';
+
+  // Check for prefix pattern in URL path: /v1/ws/{warehouse}/...
+  const path = c.req.path;
+  const prefixMatch = path.match(/^\/v1\/ws\/([^/]+)/);
+  if (prefixMatch) {
+    warehouse = decodeURIComponent(prefixMatch[1]);
+  } else {
+    // Fall back to query param or header
+    warehouse = c.req.query('warehouse') || c.req.header('X-Iceberg-Warehouse') || 'default';
+  }
 
   if (backendType === 'd1') {
     // Use D1 backend
@@ -120,13 +133,15 @@ app.use('/*', async (c, next) => {
   const authMiddleware = createAuthMiddleware<Env, Variables>({
     enabled: authEnabled,
     allowAnonymousRead,
-    publicPaths: ['/health', '/', '/v1/config'],
+    // Include both /v1/config and prefixed paths as public
+    publicPaths: ['/health', '/', '/v1/config', '/v1/ws/'],
   });
 
   return authMiddleware(c, next);
 });
 
 // Authorization middleware - sets up FGA engine for permission checks
+// Skip paths include warehouse-prefixed config endpoints
 app.use('/*', createAuthorizationMiddleware({
   skipPaths: ['/health', '/', '/v1/config'],
 }));
@@ -145,6 +160,11 @@ app.get('/health', (c) => {
 
 // Mount Iceberg REST Catalog routes at /v1
 app.route('/v1', createIcebergRoutes());
+
+// Also mount routes at /v1/ws/:warehouse for warehouse-isolated catalogs
+// The /v1/config endpoint returns prefix: "ws/{warehouse}" which tells clients
+// to prepend this to all subsequent requests, enabling multi-tenant isolation
+app.route('/v1/ws/:warehouse', createIcebergRoutes());
 
 // Root endpoint
 app.get('/', (c) => {

@@ -1452,6 +1452,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
   // -------------------------------------------------------------------------
   // GET /config - Catalog configuration
   // Returns catalog defaults including S3/R2 credentials for data access
+  // Returns prefix for warehouse-based isolation when warehouse param is provided
   // -------------------------------------------------------------------------
   api.get('/config', (c) => {
     // Build defaults with optional R2 credentials for S3-compatible access
@@ -1479,37 +1480,22 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       defaults['s3.region'] = 'auto';
     }
 
-    return c.json({
+    // If warehouse is specified, return a prefix for warehouse isolation
+    // Per Iceberg REST spec, the prefix is prepended to all subsequent requests
+    const warehouse = c.req.query('warehouse');
+    const responseData: Record<string, unknown> = {
       defaults,
       overrides: {
         // Properties that cannot be overridden by clients
       },
-      // Advertise supported endpoints so clients know what operations are available
-      endpoints: [
-        'GET /v1/{prefix}/namespaces',
-        'POST /v1/{prefix}/namespaces',
-        'GET /v1/{prefix}/namespaces/{namespace}',
-        'HEAD /v1/{prefix}/namespaces/{namespace}',
-        'DELETE /v1/{prefix}/namespaces/{namespace}',
-        'POST /v1/{prefix}/namespaces/{namespace}/properties',
-        'GET /v1/{prefix}/namespaces/{namespace}/tables',
-        'POST /v1/{prefix}/namespaces/{namespace}/tables',
-        'GET /v1/{prefix}/namespaces/{namespace}/tables/{table}',
-        'HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}',
-        'POST /v1/{prefix}/namespaces/{namespace}/tables/{table}',
-        'DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}',
-        'POST /v1/{prefix}/tables/rename',
-        'POST /v1/{prefix}/namespaces/{namespace}/register',
-        // View endpoints
-        'GET /v1/{prefix}/namespaces/{namespace}/views',
-        'POST /v1/{prefix}/namespaces/{namespace}/views',
-        'GET /v1/{prefix}/namespaces/{namespace}/views/{view}',
-        'HEAD /v1/{prefix}/namespaces/{namespace}/views/{view}',
-        'POST /v1/{prefix}/namespaces/{namespace}/views/{view}',
-        'DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}',
-        'POST /v1/{prefix}/views/rename',
-      ],
-    });
+    };
+
+    // Return prefix for warehouse isolation - the client will prepend this to all paths
+    if (warehouse) {
+      responseData.prefix = `ws/${warehouse}`;
+    }
+
+    return c.json(responseData);
   });
 
   // -------------------------------------------------------------------------
