@@ -45,6 +45,11 @@ export interface Env {
   // Storage
   R2_BUCKET: R2Bucket;
 
+  // R2 S3-compatible credentials (for external client data access)
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  R2_URL?: string;  // e.g., https://<account>.r2.cloudflarestorage.com
+
   // Authentication
   OAUTH?: OAuthService;
 

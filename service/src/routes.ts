@@ -1439,13 +1439,36 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
   // -------------------------------------------------------------------------
   // GET /config - Catalog configuration
+  // Returns catalog defaults including S3/R2 credentials for data access
   // -------------------------------------------------------------------------
   api.get('/config', (c) => {
+    // Build defaults with optional R2 credentials for S3-compatible access
+    const defaults: Record<string, string> = {
+      // Default properties for new tables
+      'write.parquet.compression-codec': 'zstd',
+    };
+
+    // Add R2/S3 credentials if configured (for external client data access)
+    // These allow Spark, DuckDB, PyIceberg to write data files directly to R2
+    const env = c.env;
+    if (env.R2_URL) {
+      defaults['s3.endpoint'] = env.R2_URL;
+    }
+    if (env.R2_ACCESS_KEY_ID) {
+      defaults['s3.access-key-id'] = env.R2_ACCESS_KEY_ID;
+    }
+    if (env.R2_SECRET_ACCESS_KEY) {
+      defaults['s3.secret-access-key'] = env.R2_SECRET_ACCESS_KEY;
+    }
+    // R2 requires path-style access (not virtual-hosted)
+    if (env.R2_URL) {
+      defaults['s3.path-style-access'] = 'true';
+      // Region is required by some clients but R2 uses 'auto'
+      defaults['s3.region'] = 'auto';
+    }
+
     return c.json({
-      defaults: {
-        // Default properties for new tables
-        'write.parquet.compression-codec': 'zstd',
-      },
+      defaults,
       overrides: {
         // Properties that cannot be overridden by clients
       },
