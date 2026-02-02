@@ -876,6 +876,138 @@ describe('Iceberg REST Catalog Routes', () => {
         // The new schema should have been added
         expect(retryData.metadata.schemas.length).toBe(2);
       });
+
+      it('should return specific error when concurrent partition spec changes conflict', async () => {
+        // Create table with initial partition spec
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'partition_conflict_test',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+              { id: 2, name: 'category', required: false, type: 'string' },
+            ],
+          },
+        });
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+        const originalPartitionId = createData.metadata['last-partition-id'];
+
+        // First client adds a partition spec
+        const firstUpdateRes = await request('POST', '/v1/namespaces/test_db/tables/partition_conflict_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+            { type: 'assert-last-assigned-partition-id', 'last-assigned-partition-id': originalPartitionId },
+          ],
+          updates: [
+            {
+              action: 'add-spec',
+              spec: {
+                'spec-id': -1,
+                fields: [
+                  { 'source-id': 2, 'field-id': 1000, name: 'category_partition', transform: 'identity' },
+                ],
+              },
+            },
+            { action: 'set-default-spec', 'spec-id': -1 },
+          ],
+        });
+        expect(firstUpdateRes.status).toBe(200);
+
+        // Second client tries to add a different partition spec with stale requirements
+        // This should fail with specific error since both are modifying partition specs
+        const conflictRes = await request('POST', '/v1/namespaces/test_db/tables/partition_conflict_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+            // This is stale - partition id changed
+            { type: 'assert-last-assigned-partition-id', 'last-assigned-partition-id': originalPartitionId },
+          ],
+          updates: [
+            {
+              action: 'add-spec',
+              spec: {
+                'spec-id': -1,
+                fields: [
+                  { 'source-id': 1, 'field-id': 1001, name: 'id_partition', transform: 'bucket[16]' },
+                ],
+              },
+            },
+            { action: 'set-default-spec', 'spec-id': -1 },
+          ],
+        });
+
+        expect(conflictRes.status).toBe(409);
+        const errorData = await conflictRes.json() as { error: { message: string; type: string } };
+        // Should contain specific message about partition id, not generic conflict message
+        expect(errorData.error.message).toContain('last assigned partition id changed');
+      });
+
+      it('should return specific error when concurrent schema changes conflict', async () => {
+        // Create table with initial schema
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'schema_conflict_test',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+        const originalFieldId = createData.metadata['last-column-id'];
+
+        // First client adds a new schema
+        const firstUpdateRes = await request('POST', '/v1/namespaces/test_db/tables/schema_conflict_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+            { type: 'assert-last-assigned-field-id', 'last-assigned-field-id': originalFieldId },
+          ],
+          updates: [
+            {
+              action: 'add-schema',
+              schema: {
+                type: 'struct',
+                'schema-id': -1,
+                fields: [
+                  { id: 1, name: 'id', required: true, type: 'long' },
+                  { id: 2, name: 'name', required: false, type: 'string' },
+                ],
+              },
+            },
+            { action: 'set-current-schema', 'schema-id': -1 },
+          ],
+        });
+        expect(firstUpdateRes.status).toBe(200);
+
+        // Second client tries to add a different schema with stale requirements
+        const conflictRes = await request('POST', '/v1/namespaces/test_db/tables/schema_conflict_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+            // This is stale - field id changed
+            { type: 'assert-last-assigned-field-id', 'last-assigned-field-id': originalFieldId },
+          ],
+          updates: [
+            {
+              action: 'add-schema',
+              schema: {
+                type: 'struct',
+                'schema-id': -1,
+                fields: [
+                  { id: 1, name: 'id', required: true, type: 'long' },
+                  { id: 3, name: 'description', required: false, type: 'string' },
+                ],
+              },
+            },
+            { action: 'set-current-schema', 'schema-id': -1 },
+          ],
+        });
+
+        expect(conflictRes.status).toBe(409);
+        const errorData = await conflictRes.json() as { error: { message: string; type: string } };
+        // Should contain specific message about field id, not generic conflict message
+        expect(errorData.error.message).toContain('last assigned field id changed');
+      });
     });
   });
 

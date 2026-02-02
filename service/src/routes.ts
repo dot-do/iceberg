@@ -8,7 +8,6 @@
 
 import { Hono } from 'hono';
 import type { Context } from 'hono';
-import JSONBig from 'json-bigint';
 import type { Env } from './index.js';
 import {
   requireNamespacePermission,
@@ -475,24 +474,49 @@ function normalizeSchemaWithMapping(schema: IcebergSchema): { schema: IcebergSch
 }
 
 /**
- * Legacy function that returns only the normalized schema (for backward compatibility).
+ * Collect all valid field IDs from a schema (including nested types).
  */
-function normalizeSchema(schema: IcebergSchema): IcebergSchema {
-  return normalizeSchemaWithMapping(schema).schema;
+function collectFieldIds(schema: IcebergSchema, ids: Set<number>): void {
+  for (const field of schema.fields) {
+    if (isValidFieldId(field.id)) {
+      ids.add(field.id);
+    }
+    collectFieldIdsFromType(field.type, ids);
+  }
 }
 
 /**
- * Reassign a field with a fresh ID, tracking the mapping from old ID to new ID.
+ * Collect field IDs from a type (handles nested structs, lists, maps).
  */
-function reassignFieldWithMapping(field: IcebergField, ctx: FieldIdContext, idMapping: Map<number, number>): IcebergField {
-  const newId = ctx.nextId++;
-  idMapping.set(field.id, newId);
+function collectFieldIdsFromType(type: string | IcebergSchema | IcebergListType | IcebergMapType, ids: Set<number>): void {
+  if (typeof type === 'string') return;
+
+  if ('fields' in type && type.type === 'struct') {
+    collectFieldIds(type, ids);
+  } else if ('element-id' in type) {
+    if (isValidFieldId(type['element-id'])) ids.add(type['element-id']);
+    collectFieldIdsFromType(type.element, ids);
+  } else if ('key-id' in type) {
+    if (isValidFieldId(type['key-id'])) ids.add(type['key-id']);
+    if (isValidFieldId(type['value-id'])) ids.add(type['value-id']);
+    collectFieldIdsFromType(type.key, ids);
+    collectFieldIdsFromType(type.value, ids);
+  }
+}
+
+/**
+ * Preserve field ID if valid, otherwise assign a new one. Track the mapping.
+ */
+function preserveOrAssignFieldId(field: IcebergField, ctx: FieldIdContext, idMapping: Map<number, number>): IcebergField {
+  const oldId = field.id;
+  const newId = isValidFieldId(oldId) ? oldId : ctx.nextId++;
+  idMapping.set(oldId, newId);
 
   const copy: IcebergField = {
     id: newId,
     name: field.name,
     required: field.required,
-    type: reassignTypeWithMapping(field.type, ctx, idMapping),
+    type: preserveOrAssignTypeIds(field.type, ctx, idMapping),
   };
   if (field.doc !== undefined) {
     copy.doc = field.doc;
@@ -501,15 +525,35 @@ function reassignFieldWithMapping(field: IcebergField, ctx: FieldIdContext, idMa
 }
 
 /**
- * Reassign IDs in a nested type, tracking the mapping.
+ * ALWAYS reassign a field with a fresh ID, tracking the mapping from old to new.
+ * Used for table creation where IDs should be normalized to sequential starting from 1.
  */
-function reassignTypeWithMapping(type: string | IcebergSchema | IcebergListType | IcebergMapType, ctx: FieldIdContext, idMapping: Map<number, number>): string | IcebergSchema | IcebergListType | IcebergMapType {
+function reassignFieldWithMapping(field: IcebergField, ctx: FieldIdContext, idMapping: Map<number, number>): IcebergField {
+  const oldId = field.id;
+  const newId = ctx.nextId++;
+  idMapping.set(oldId, newId);
+
+  const copy: IcebergField = {
+    id: newId,
+    name: field.name,
+    required: field.required,
+    type: reassignTypeIdsWithMapping(field.type, ctx, idMapping),
+  };
+  if (field.doc !== undefined) {
+    copy.doc = field.doc;
+  }
+  return copy;
+}
+
+/**
+ * ALWAYS reassign IDs in a nested type, tracking the mapping.
+ */
+function reassignTypeIdsWithMapping(type: string | IcebergSchema | IcebergListType | IcebergMapType, ctx: FieldIdContext, idMapping: Map<number, number>): string | IcebergSchema | IcebergListType | IcebergMapType {
   if (typeof type === 'string') {
     return type;
   }
 
   if ('fields' in type && type.type === 'struct') {
-    // It's a struct type
     const result: IcebergSchema = {
       type: 'struct',
       fields: type.fields.map(f => reassignFieldWithMapping(f, ctx, idMapping)),
@@ -525,34 +569,97 @@ function reassignTypeWithMapping(type: string | IcebergSchema | IcebergListType 
   }
 
   if ('element-id' in type) {
-    // It's a list type
+    const oldElementId = type['element-id'];
     const newElementId = ctx.nextId++;
-    idMapping.set(type['element-id'], newElementId);
+    idMapping.set(oldElementId, newElementId);
     return {
       type: 'list',
       'element-id': newElementId,
-      element: reassignTypeWithMapping(type.element, ctx, idMapping),
+      element: reassignTypeIdsWithMapping(type.element, ctx, idMapping),
       'element-required': type['element-required'],
     } as IcebergListType;
   }
 
   if ('key-id' in type) {
-    // It's a map type
+    const oldKeyId = type['key-id'];
+    const oldValueId = type['value-id'];
     const newKeyId = ctx.nextId++;
     const newValueId = ctx.nextId++;
-    idMapping.set(type['key-id'], newKeyId);
-    idMapping.set(type['value-id'], newValueId);
+    idMapping.set(oldKeyId, newKeyId);
+    idMapping.set(oldValueId, newValueId);
     return {
       type: 'map',
       'key-id': newKeyId,
-      key: reassignTypeWithMapping(type.key, ctx, idMapping),
+      key: reassignTypeIdsWithMapping(type.key, ctx, idMapping),
       'value-id': newValueId,
-      value: reassignTypeWithMapping(type.value, ctx, idMapping),
+      value: reassignTypeIdsWithMapping(type.value, ctx, idMapping),
       'value-required': type['value-required'],
     } as IcebergMapType;
   }
 
   return type;
+}
+
+/**
+ * Preserve or assign IDs in a nested type, tracking the mapping.
+ */
+function preserveOrAssignTypeIds(type: string | IcebergSchema | IcebergListType | IcebergMapType, ctx: FieldIdContext, idMapping: Map<number, number>): string | IcebergSchema | IcebergListType | IcebergMapType {
+  if (typeof type === 'string') {
+    return type;
+  }
+
+  if ('fields' in type && type.type === 'struct') {
+    const result: IcebergSchema = {
+      type: 'struct',
+      fields: type.fields.map(f => preserveOrAssignFieldId(f, ctx, idMapping)),
+    };
+    if (type['schema-id'] !== undefined) {
+      result['schema-id'] = type['schema-id'];
+    }
+    if (type['identifier-field-ids'] !== undefined) {
+      result['identifier-field-ids'] = type['identifier-field-ids']
+        .map(id => idMapping.get(id) ?? id);
+    }
+    return result;
+  }
+
+  if ('element-id' in type) {
+    const oldElementId = type['element-id'];
+    const newElementId = isValidFieldId(oldElementId) ? oldElementId : ctx.nextId++;
+    idMapping.set(oldElementId, newElementId);
+    return {
+      type: 'list',
+      'element-id': newElementId,
+      element: preserveOrAssignTypeIds(type.element, ctx, idMapping),
+      'element-required': type['element-required'],
+    } as IcebergListType;
+  }
+
+  if ('key-id' in type) {
+    const oldKeyId = type['key-id'];
+    const oldValueId = type['value-id'];
+    const newKeyId = isValidFieldId(oldKeyId) ? oldKeyId : ctx.nextId++;
+    const newValueId = isValidFieldId(oldValueId) ? oldValueId : ctx.nextId++;
+    idMapping.set(oldKeyId, newKeyId);
+    idMapping.set(oldValueId, newValueId);
+    return {
+      type: 'map',
+      'key-id': newKeyId,
+      key: preserveOrAssignTypeIds(type.key, ctx, idMapping),
+      'value-id': newValueId,
+      value: preserveOrAssignTypeIds(type.value, ctx, idMapping),
+      'value-required': type['value-required'],
+    } as IcebergMapType;
+  }
+
+  return type;
+}
+
+/**
+ * Legacy function that returns only the normalized schema (for backward compatibility).
+ */
+function normalizeSchema(schema: IcebergSchema): IcebergSchema {
+  return normalizeSchemaWithMapping(schema).schema;
 }
 
 /**
@@ -627,9 +734,9 @@ function reassignType(type: string | IcebergSchema | IcebergListType | IcebergMa
 /**
  * Create default table metadata.
  *
- * This function normalizes the schema by reassigning all field IDs sequentially
- * starting from 1. The partition spec and sort order source-ids are updated
- * to reference the new field IDs using the mapping from the normalization.
+ * Per Iceberg spec, when creating a table, the catalog SHOULD reassign all field IDs
+ * sequentially starting from 1, ensuring uniqueness and sequential assignment.
+ * The partition spec and sort order source-ids are updated to reference the new field IDs.
  */
 function createDefaultMetadata(
   tableUuid: string,
@@ -653,7 +760,7 @@ function createDefaultMetadata(
   const maxFieldId = findMaxFieldId(normalizedSchema);
 
   // Remap partition spec source-ids using the ID mapping
-  let remappedPartitionSpec: PartitionSpec;
+  let finalPartitionSpec: PartitionSpec;
   if (partitionSpec && partitionSpec.fields.length > 0) {
     const remappedFields = partitionSpec.fields.map(pf => {
       const newSourceId = idMapping.get(pf['source-id']);
@@ -669,20 +776,20 @@ function createDefaultMetadata(
     }).filter((f): f is PartitionField => f !== null);
 
     if (remappedFields.length > 0) {
-      remappedPartitionSpec = {
+      finalPartitionSpec = {
         'spec-id': partitionSpec['spec-id'],
         fields: remappedFields,
       };
     } else {
       // All fields were invalid, fall back to unpartitioned
-      remappedPartitionSpec = { 'spec-id': 0, fields: [] };
+      finalPartitionSpec = { 'spec-id': 0, fields: [] };
     }
   } else {
-    remappedPartitionSpec = { 'spec-id': 0, fields: [] };
+    finalPartitionSpec = { 'spec-id': 0, fields: [] };
   }
 
   // Remap sort order source-ids using the ID mapping
-  let remappedSortOrder: SortOrder;
+  let finalSortOrder: SortOrder;
   if (sortOrder && sortOrder.fields.length > 0) {
     const remappedFields = sortOrder.fields.map(sf => {
       const newSourceId = idMapping.get(sf['source-id']);
@@ -698,20 +805,29 @@ function createDefaultMetadata(
     }).filter((f): f is SortField => f !== null);
 
     if (remappedFields.length > 0) {
-      remappedSortOrder = {
+      finalSortOrder = {
         'order-id': sortOrder['order-id'],
         fields: remappedFields,
       };
     } else {
       // All fields were invalid, fall back to unsorted
-      remappedSortOrder = { 'order-id': 0, fields: [] };
+      finalSortOrder = { 'order-id': 0, fields: [] };
     }
   } else {
-    remappedSortOrder = { 'order-id': 0, fields: [] };
+    finalSortOrder = { 'order-id': 0, fields: [] };
+  }
+
+  // Determine format version from properties (default to 2)
+  let formatVersion = 2;
+  if (properties?.['format-version']) {
+    const requested = parseInt(properties['format-version'], 10);
+    if (!isNaN(requested) && requested >= 1 && requested <= 2) {
+      formatVersion = requested;
+    }
   }
 
   return {
-    'format-version': 2,
+    'format-version': formatVersion,
     'table-uuid': tableUuid,
     location,
     'last-sequence-number': 0,
@@ -719,12 +835,15 @@ function createDefaultMetadata(
     'last-column-id': maxFieldId,
     'current-schema-id': normalizedSchema['schema-id']!,
     schemas: [normalizedSchema],
-    'default-spec-id': remappedPartitionSpec['spec-id'],
-    'partition-specs': [remappedPartitionSpec],
-    'last-partition-id': findMaxPartitionFieldId(remappedPartitionSpec),
-    'default-sort-order-id': remappedSortOrder['order-id'],
-    'sort-orders': [remappedSortOrder],
-    properties: properties ?? {},
+    'default-spec-id': finalPartitionSpec['spec-id'],
+    'partition-specs': [finalPartitionSpec],
+    'last-partition-id': findMaxPartitionFieldId(finalPartitionSpec),
+    'default-sort-order-id': finalSortOrder['order-id'],
+    'sort-orders': [finalSortOrder],
+    // Filter out reserved properties that should not be persisted
+    properties: properties
+      ? Object.fromEntries(Object.entries(properties).filter(([key]) => !RESERVED_PROPERTIES.has(key)))
+      : {},
     snapshots: [],
     'snapshot-log': [],
     'metadata-log': [],
@@ -1139,95 +1258,148 @@ function canRebaseUpdates(
 }
 
 /**
+ * Determine which requirement failures indicate true conflicts that cannot be rebased,
+ * given the specific updates being applied.
+ *
+ * A requirement failure is only a true conflict if the updates touch the same aspect
+ * of the table that the requirement is asserting about.
+ */
+function getConflictingRequirements(
+  updates: TableUpdate[],
+  failedRequirements: Array<{ type: string; message: string }>
+): Array<{ type: string; message: string }> {
+  // Determine what aspects of the table the updates modify
+  const modifiesSchema = updates.some(u =>
+    u.action === 'add-schema' ||
+    u.action === 'set-current-schema'
+  );
+  const modifiesPartitionSpec = updates.some(u =>
+    u.action === 'add-spec' ||
+    u.action === 'set-default-spec'
+  );
+  const modifiesSortOrder = updates.some(u =>
+    u.action === 'add-sort-order' ||
+    u.action === 'set-default-sort-order'
+  );
+
+  // Find failed requirements that conflict with what we're modifying
+  return failedRequirements.filter(f => {
+    switch (f.type) {
+      case 'assert-current-schema-id':
+      case 'assert-last-assigned-field-id':
+        return modifiesSchema;
+      case 'assert-default-spec-id':
+      case 'assert-last-assigned-partition-id':
+        return modifiesPartitionSpec;
+      case 'assert-default-sort-order-id':
+        return modifiesSortOrder;
+      // These are always conflicts - can't rebase if UUID mismatch or table doesn't exist as expected
+      case 'assert-table-uuid':
+      case 'assert-create':
+        return true;
+      default:
+        return false;
+    }
+  });
+}
+
+/**
  * Validate table requirements against current metadata.
- * Returns which requirement type failed (if any) for proper error messaging.
+ * Returns all failures found, with priority given to non-rebaseable requirements.
  */
 function validateRequirements(
   metadata: TableMetadata | null,
   requirements: TableRequirement[]
-): { valid: boolean; message?: string; failedRequirement?: string } {
+): { valid: boolean; message?: string; failedRequirement?: string; allFailures?: Array<{ type: string; message: string }> } {
+  const failures: Array<{ type: string; message: string }> = [];
+
   for (const req of requirements) {
     switch (req.type) {
       case 'assert-create':
         if (metadata !== null) {
-          return { valid: false, message: 'Requirement failed: table already exists', failedRequirement: 'assert-create' };
+          failures.push({ type: 'assert-create', message: 'Requirement failed: table already exists' });
         }
         break;
 
       case 'assert-table-uuid':
         if (!metadata || metadata['table-uuid'] !== req.uuid) {
-          return { valid: false, message: `Requirement failed: table UUID mismatch expected ${req.uuid}, got ${metadata?.['table-uuid'] ?? 'null'}`, failedRequirement: 'assert-table-uuid' };
+          failures.push({ type: 'assert-table-uuid', message: `Requirement failed: table UUID mismatch expected ${req.uuid}, got ${metadata?.['table-uuid'] ?? 'null'}` });
         }
         break;
 
       case 'assert-ref-snapshot-id': {
         if (!metadata) {
-          return { valid: false, message: 'Requirement failed: table does not exist', failedRequirement: 'assert-ref-snapshot-id' };
-        }
-        const refSnapshotId = metadata.refs?.[req.ref]?.['snapshot-id'] ?? null;
-        if (refSnapshotId !== req['snapshot-id']) {
-          return {
-            valid: false,
-            message: `Requirement failed: snapshot ID mismatch for ref ${req.ref} expected ${req['snapshot-id']}, got ${refSnapshotId}`,
-            failedRequirement: 'assert-ref-snapshot-id',
-          };
+          failures.push({ type: 'assert-ref-snapshot-id', message: 'Requirement failed: table does not exist' });
+        } else {
+          const refSnapshotId = metadata.refs?.[req.ref]?.['snapshot-id'] ?? null;
+          if (refSnapshotId !== req['snapshot-id']) {
+            failures.push({
+              type: 'assert-ref-snapshot-id',
+              message: `Requirement failed: snapshot ID mismatch for ref ${req.ref} expected ${req['snapshot-id']}, got ${refSnapshotId}`,
+            });
+          }
         }
         break;
       }
 
       case 'assert-last-assigned-field-id':
         if (!metadata || metadata['last-column-id'] !== req['last-assigned-field-id']) {
-          return {
-            valid: false,
+          failures.push({
+            type: 'assert-last-assigned-field-id',
             message: 'Requirement failed: last assigned field id changed',
-            failedRequirement: 'assert-last-assigned-field-id',
-          };
+          });
         }
         break;
 
       case 'assert-current-schema-id':
         if (!metadata || metadata['current-schema-id'] !== req['current-schema-id']) {
-          return {
-            valid: false,
+          failures.push({
+            type: 'assert-current-schema-id',
             message: 'Requirement failed: current schema changed',
-            failedRequirement: 'assert-current-schema-id',
-          };
+          });
         }
         break;
 
       case 'assert-last-assigned-partition-id':
         if (!metadata || metadata['last-partition-id'] !== req['last-assigned-partition-id']) {
-          return {
-            valid: false,
+          failures.push({
+            type: 'assert-last-assigned-partition-id',
             message: 'Requirement failed: last assigned partition id changed',
-            failedRequirement: 'assert-last-assigned-partition-id',
-          };
+          });
         }
         break;
 
       case 'assert-default-spec-id':
         if (!metadata || metadata['default-spec-id'] !== req['default-spec-id']) {
-          return {
-            valid: false,
+          failures.push({
+            type: 'assert-default-spec-id',
             message: 'Requirement failed: default partition spec changed',
-            failedRequirement: 'assert-default-spec-id',
-          };
+          });
         }
         break;
 
       case 'assert-default-sort-order-id':
         if (!metadata || metadata['default-sort-order-id'] !== req['default-sort-order-id']) {
-          return {
-            valid: false,
+          failures.push({
+            type: 'assert-default-sort-order-id',
             message: 'Requirement failed: default sort order changed',
-            failedRequirement: 'assert-default-sort-order-id',
-          };
+          });
         }
         break;
     }
   }
 
-  return { valid: true };
+  if (failures.length === 0) {
+    return { valid: true };
+  }
+
+  // Return the first failure, with all failures available for conflict analysis
+  return {
+    valid: false,
+    message: failures[0].message,
+    failedRequirement: failures[0].type,
+    allFailures: failures,
+  };
 }
 
 // ============================================================================
@@ -1616,6 +1788,17 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
 
+        // Check if a view with the same name exists (cross-type conflict)
+        const viewResponse = await catalog.fetch(
+          new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/views/${encodeURIComponent(body.name)}`, {
+            method: 'HEAD',
+          })
+        );
+
+        if (viewResponse.ok) {
+          return icebergError(c, `View already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+        }
+
         // Return staged metadata without creating the table
         return c.json({
           'metadata-location': metadataLocation,
@@ -1891,24 +2074,18 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         const validation = validateRequirements(currentMetadata, requirements);
 
         if (!validation.valid) {
-          // Check which requirement failed - some requirements indicate true conflicts that cannot be rebased
-          const nonRebaseableRequirements = [
-            'assert-current-schema-id',
-            'assert-last-assigned-field-id',
-            'assert-default-spec-id',
-            'assert-last-assigned-partition-id',
-            'assert-default-sort-order-id',
-          ];
-
-          // If a non-rebaseable requirement failed, return the specific error message
-          if (validation.failedRequirement && nonRebaseableRequirements.includes(validation.failedRequirement)) {
-            return icebergError(c, validation.message!, 'CommitFailedException', 409);
-          }
-
           // Requirements don't match current state - check if server-side retry is possible
           // Server-side retry only applies when there are actual updates to rebase
           if (currentMetadata !== null && !hasAssertCreate && updates.length > 0) {
-            // Check if updates can be safely rebased onto the new metadata
+            // Check if any failed requirements indicate a true conflict with the updates
+            const conflictingRequirements = getConflictingRequirements(updates, validation.allFailures ?? []);
+
+            if (conflictingRequirements.length > 0) {
+              // There's a true conflict - a requirement failure relates to what we're trying to change
+              return icebergError(c, conflictingRequirements[0].message, 'CommitFailedException', 409);
+            }
+
+            // No conflicting requirements - check if updates can be safely rebased onto the new metadata
             if (canRebaseUpdates(updates, currentMetadata)) {
               // Updates can be rebased - use server-side retry
               // Update requirements to match current state and continue
@@ -1922,7 +2099,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
               }
               // Continue with the commit using updated requirements
             } else {
-              // Cannot rebase - there's a true conflict (e.g., duplicate IDs)
+              // Cannot rebase - there's a true conflict (e.g., duplicate schema/spec/snapshot IDs)
               return icebergError(
                 c,
                 'Commit conflict: updates cannot be applied to current table state due to conflicting changes',
@@ -1940,15 +2117,18 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         let newMetadata: TableMetadata;
         if (hasAssertCreate && currentMetadata === null) {
           // This is a create transaction - build initial metadata from updates
-          // First, find the assign-uuid and set-location updates to get the basics
+          // First, find the assign-uuid, set-location, and upgrade-format-version updates
           let tableUuid = crypto.randomUUID();
           let tableLocation = '';
+          let formatVersion = 2;
 
           for (const update of body.updates ?? []) {
             if (update.action === 'assign-uuid') {
               tableUuid = update.uuid;
             } else if (update.action === 'set-location') {
               tableLocation = update.location;
+            } else if (update.action === 'upgrade-format-version') {
+              formatVersion = update['format-version'];
             }
           }
 
@@ -1961,7 +2141,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           // Create minimal skeleton metadata (no schemas yet - they'll come from updates)
           const now = Date.now();
           const baseMetadata: TableMetadata = {
-            'format-version': 2,
+            'format-version': formatVersion,
             'table-uuid': tableUuid,
             location: tableLocation,
             'last-sequence-number': 0,
@@ -2029,8 +2209,13 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
           if (!createResponse.ok) {
             const error = await createResponse.json() as { error: string };
-            if (createResponse.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('already exists')) {
+            // Check for table already exists
+            if (createResponse.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('Table already exists')) {
               return icebergError(c, `Table already exists: ${namespace.join('.')}.${tableName}`, 'AlreadyExistsException', 409);
+            }
+            // Check for cross-type conflict (view exists with same name)
+            if (error.error?.includes('View already exists') || error.error?.includes('View with same name')) {
+              return icebergError(c, `View already exists: ${namespace.join('.')}.${tableName}`, 'AlreadyExistsException', 409);
             }
             if (createResponse.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
               return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
@@ -2336,6 +2521,22 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         return icebergError(c, 'View version is required', 'BadRequestException', 400);
       }
 
+      // Validate representations - no duplicate dialects allowed
+      if (body['view-version'].representations) {
+        const dialects = new Set<string>();
+        for (const rep of body['view-version'].representations) {
+          if (dialects.has(rep.dialect)) {
+            return icebergError(
+              c,
+              `Cannot add multiple queries for dialect ${rep.dialect}`,
+              'BadRequestException',
+              400
+            );
+          }
+          dialects.add(rep.dialect);
+        }
+      }
+
       // Generate view UUID
       const viewUuid = crypto.randomUUID();
 
@@ -2356,6 +2557,13 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         'version-id': body['view-version']['version-id'] ?? 1,
         'timestamp-ms': body['view-version']['timestamp-ms'] ?? now,
         'schema-id': normalizedSchema['schema-id']!,
+        // Ensure default-namespace is set (required per Iceberg spec)
+        'default-namespace': body['view-version']['default-namespace'] ?? namespace,
+        // Ensure summary includes operation field for RCK tests
+        summary: {
+          ...body['view-version'].summary,
+          operation: body['view-version'].summary?.operation ?? 'create',
+        },
       };
 
       const viewMetadata: ViewMetadata = {
@@ -2394,7 +2602,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           return icebergError(c, `View already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
         // Check for cross-type conflict (table exists with same name)
-        if (error.error?.includes('Table already exists')) {
+        if (error.error?.includes('Table already exists') || error.error?.includes('Table with same name')) {
           return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
         if (response.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
@@ -2543,7 +2751,33 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
             }
 
             case 'add-view-version': {
-              const newVersion = update['view-version'];
+              const inputVersion = update['view-version'];
+
+              // Validate representations - no duplicate dialects allowed
+              if (inputVersion.representations) {
+                const dialects = new Set<string>();
+                for (const rep of inputVersion.representations) {
+                  if (dialects.has(rep.dialect)) {
+                    throw new Error(`Cannot add multiple queries for dialect ${rep.dialect}`);
+                  }
+                  dialects.add(rep.dialect);
+                }
+              }
+
+              // Ensure default-namespace is set (required per Iceberg spec)
+              // Fall back to current view's default namespace or an empty array
+              const existingDefaultNs = newMetadata.versions.length > 0
+                ? newMetadata.versions[newMetadata.versions.length - 1]['default-namespace']
+                : namespace;
+              const newVersion: ViewVersion = {
+                ...inputVersion,
+                'default-namespace': inputVersion['default-namespace'] ?? existingDefaultNs ?? [],
+                // Ensure summary includes operation field for RCK tests
+                summary: {
+                  ...inputVersion.summary,
+                  operation: inputVersion.summary?.operation ?? 'replace',
+                },
+              };
               newMetadata.versions = [...newMetadata.versions, newVersion];
               newMetadata['version-log'] = [
                 ...newMetadata['version-log'],
