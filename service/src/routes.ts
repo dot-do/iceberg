@@ -247,14 +247,76 @@ function icebergError(
 }
 
 /**
- * Deep copy a schema field to preserve field IDs exactly.
+ * Check if a field ID is valid (positive integer).
+ * Per Iceberg spec, field IDs must be positive integers.
  */
-function deepCopyField(field: IcebergField): IcebergField {
+function isValidFieldId(id: unknown): id is number {
+  return typeof id === 'number' && id > 0 && Number.isInteger(id);
+}
+
+/**
+ * Find the maximum valid field ID in a schema (first pass).
+ * Returns 0 if no valid field IDs are found.
+ */
+function findMaxValidFieldId(schema: IcebergSchema): number {
+  let maxId = 0;
+
+  function traverse(type: string | IcebergSchema | IcebergListType | IcebergMapType): void {
+    if (typeof type === 'string') return;
+
+    if ('fields' in type && Array.isArray(type.fields)) {
+      for (const field of type.fields) {
+        if (isValidFieldId(field.id)) {
+          maxId = Math.max(maxId, field.id);
+        }
+        traverse(field.type);
+      }
+    }
+
+    if ('element-id' in type) {
+      if (isValidFieldId(type['element-id'])) {
+        maxId = Math.max(maxId, type['element-id']);
+      }
+      traverse(type.element);
+    }
+
+    if ('key-id' in type) {
+      if (isValidFieldId(type['key-id'])) {
+        maxId = Math.max(maxId, type['key-id']);
+      }
+      if (isValidFieldId(type['value-id'])) {
+        maxId = Math.max(maxId, type['value-id']);
+      }
+      traverse(type.key);
+      traverse(type.value);
+    }
+  }
+
+  traverse(schema);
+  return maxId;
+}
+
+/**
+ * Context for assigning field IDs during schema normalization.
+ */
+interface FieldIdContext {
+  nextId: number;
+}
+
+/**
+ * Deep copy and normalize a schema field, assigning IDs if missing.
+ * If field.id is missing, 0, or negative, assigns a new sequential ID.
+ * If field.id is valid (positive), preserves it exactly.
+ */
+function normalizeField(field: IcebergField, ctx: FieldIdContext): IcebergField {
+  // Assign ID if missing or invalid, otherwise preserve
+  const id = isValidFieldId(field.id) ? field.id : ctx.nextId++;
+
   const copy: IcebergField = {
-    id: field.id,
+    id,
     name: field.name,
     required: field.required,
-    type: deepCopyType(field.type),
+    type: normalizeType(field.type, ctx),
   };
   if (field.doc !== undefined) {
     copy.doc = field.doc;
@@ -263,9 +325,9 @@ function deepCopyField(field: IcebergField): IcebergField {
 }
 
 /**
- * Deep copy a type (handles nested structs, lists, maps).
+ * Deep copy and normalize a type, assigning IDs to nested elements if missing.
  */
-function deepCopyType(type: string | IcebergSchema | IcebergListType | IcebergMapType): string | IcebergSchema | IcebergListType | IcebergMapType {
+function normalizeType(type: string | IcebergSchema | IcebergListType | IcebergMapType, ctx: FieldIdContext): string | IcebergSchema | IcebergListType | IcebergMapType {
   if (typeof type === 'string') {
     return type;
   }
@@ -274,7 +336,7 @@ function deepCopyType(type: string | IcebergSchema | IcebergListType | IcebergMa
     // It's a struct type
     const result: IcebergSchema = {
       type: 'struct',
-      fields: type.fields.map(deepCopyField),
+      fields: type.fields.map(f => normalizeField(f, ctx)),
     };
     if (type['schema-id'] !== undefined) {
       result['schema-id'] = type['schema-id'];
@@ -286,23 +348,26 @@ function deepCopyType(type: string | IcebergSchema | IcebergListType | IcebergMa
   }
 
   if ('element-id' in type) {
-    // It's a list type
+    // It's a list type - assign element-id if missing
+    const elementId = isValidFieldId(type['element-id']) ? type['element-id'] : ctx.nextId++;
     return {
       type: 'list',
-      'element-id': type['element-id'],
-      element: deepCopyType(type.element),
+      'element-id': elementId,
+      element: normalizeType(type.element, ctx),
       'element-required': type['element-required'],
     } as IcebergListType;
   }
 
   if ('key-id' in type) {
-    // It's a map type
+    // It's a map type - assign key-id and value-id if missing
+    const keyId = isValidFieldId(type['key-id']) ? type['key-id'] : ctx.nextId++;
+    const valueId = isValidFieldId(type['value-id']) ? type['value-id'] : ctx.nextId++;
     return {
       type: 'map',
-      'key-id': type['key-id'],
-      key: deepCopyType(type.key),
-      'value-id': type['value-id'],
-      value: deepCopyType(type.value),
+      'key-id': keyId,
+      key: normalizeType(type.key, ctx),
+      'value-id': valueId,
+      value: normalizeType(type.value, ctx),
       'value-required': type['value-required'],
     } as IcebergMapType;
   }
@@ -312,10 +377,56 @@ function deepCopyType(type: string | IcebergSchema | IcebergListType | IcebergMa
 }
 
 /**
+ * Normalize a schema by ensuring all fields have valid IDs.
+ * Uses two-pass approach:
+ * 1. Find max existing valid ID
+ * 2. Assign new IDs starting from max+1 for fields without valid IDs
+ */
+function normalizeSchema(schema: IcebergSchema): IcebergSchema {
+  // First pass: find max existing valid ID
+  const maxExistingId = findMaxValidFieldId(schema);
+
+  // Second pass: assign IDs starting from max+1 for missing IDs
+  const ctx: FieldIdContext = { nextId: maxExistingId + 1 };
+
+  const result: IcebergSchema = {
+    type: 'struct',
+    fields: schema.fields.map(f => normalizeField(f, ctx)),
+  };
+
+  if (schema['schema-id'] !== undefined) {
+    result['schema-id'] = schema['schema-id'];
+  }
+  if (schema['identifier-field-ids'] !== undefined) {
+    result['identifier-field-ids'] = [...schema['identifier-field-ids']];
+  }
+
+  return result;
+}
+
+/**
+ * Deep copy a schema field preserving field IDs exactly (legacy function).
+ */
+function deepCopyField(field: IcebergField): IcebergField {
+  const ctx: FieldIdContext = { nextId: 1 };
+  return normalizeField(field, ctx);
+}
+
+/**
+ * Deep copy a type preserving IDs (legacy function).
+ */
+function deepCopyType(type: string | IcebergSchema | IcebergListType | IcebergMapType): string | IcebergSchema | IcebergListType | IcebergMapType {
+  const ctx: FieldIdContext = { nextId: 1 };
+  return normalizeType(type, ctx);
+}
+
+/**
  * Create default table metadata.
  *
- * IMPORTANT: This function preserves the exact field IDs from the input schema.
- * Field IDs are never reassigned - they are used exactly as provided in the request.
+ * This function normalizes the schema by:
+ * - Preserving valid field IDs (positive integers) exactly as provided
+ * - Assigning sequential IDs starting from 1 for fields without valid IDs
+ * - Ensuring all nested types (lists, maps) have valid element/key/value IDs
  */
 function createDefaultMetadata(
   tableUuid: string,
@@ -327,18 +438,15 @@ function createDefaultMetadata(
 ): TableMetadata {
   const now = Date.now();
 
-  // Deep copy the schema to ensure field IDs are preserved exactly as provided.
-  // This prevents any potential mutation of the original schema from affecting
-  // the stored metadata, and ensures field IDs are never reassigned.
-  const normalizedSchema: IcebergSchema = {
-    type: 'struct',
-    'schema-id': schema['schema-id'] ?? 0,
-    fields: schema.fields.map(deepCopyField),
-  };
+  // Normalize the schema: preserve valid IDs, assign sequential IDs where missing.
+  // Uses two-pass approach to avoid ID conflicts:
+  // 1. Find max existing valid ID in the schema
+  // 2. Assign new IDs starting from max+1 for fields without valid IDs
+  const normalizedSchema = normalizeSchema(schema);
 
-  // Copy identifier-field-ids if present
-  if (schema['identifier-field-ids']) {
-    normalizedSchema['identifier-field-ids'] = [...schema['identifier-field-ids']];
+  // Ensure schema-id is set (default to 0)
+  if (normalizedSchema['schema-id'] === undefined) {
+    normalizedSchema['schema-id'] = schema['schema-id'] ?? 0;
   }
 
   // Find max field ID in schema (used for last-column-id tracking)
