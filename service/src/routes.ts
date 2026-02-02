@@ -1323,7 +1323,7 @@ function validateRequirements(
 
       case 'assert-table-uuid':
         if (!metadata || metadata['table-uuid'] !== req.uuid) {
-          failures.push({ type: 'assert-table-uuid', message: `Requirement failed: table UUID mismatch expected ${req.uuid}, got ${metadata?.['table-uuid'] ?? 'null'}` });
+          failures.push({ type: 'assert-table-uuid', message: `Requirement failed: UUID does not match: expected ${req.uuid}, got ${metadata?.['table-uuid'] ?? 'null'}` });
         }
         break;
 
@@ -2192,8 +2192,12 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         }
 
         // Generate new metadata location
+        // The location must be unique per commit to ensure the Java client detects state changes.
+        // Include both sequence number and timestamp to guarantee uniqueness even for metadata-only
+        // changes that don't increment the sequence number.
         const seqNum = (newMetadata['last-sequence-number'] ?? 0).toString().padStart(5, '0');
-        const newMetadataLocation = `${newMetadata.location}/metadata/${seqNum}-${newMetadata['table-uuid']}.metadata.json`;
+        const timestamp = newMetadata['last-updated-ms'];
+        const newMetadataLocation = `${newMetadata.location}/metadata/${seqNum}-${timestamp}-${newMetadata['table-uuid']}.metadata.json`;
 
         // If this is an update (not a create), add the previous metadata location to metadata-log
         if (tableData?.metadataLocation && currentMetadata !== null) {
@@ -2620,13 +2624,14 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
       if (!response.ok) {
         const error = await response.json() as { error: string };
+        // Check for cross-type conflict FIRST (table exists with same name)
+        // Must check before generic 409 handling since TableAlreadyExistsError also returns 409
+        if (error.error?.includes('Table already exists') || error.error?.includes('Table with same name')) {
+          return icebergError(c, `Table with same name already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+        }
         // Check for view already exists
         if (response.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('View already exists')) {
           return icebergError(c, `View already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
-        }
-        // Check for cross-type conflict (table exists with same name)
-        if (error.error?.includes('Table already exists') || error.error?.includes('Table with same name')) {
-          return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
         if (response.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
           return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
@@ -2742,7 +2747,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           if (req.type === 'assert-view-uuid' && currentMetadata['view-uuid'] !== req.uuid) {
             return icebergError(
               c,
-              `View UUID mismatch: expected ${req.uuid}, got ${currentMetadata['view-uuid']}`,
+              `Requirement failed: UUID does not match: expected ${req.uuid}, got ${currentMetadata['view-uuid']}`,
               'CommitFailedException',
               409
             );
@@ -2752,6 +2757,9 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
       // Apply updates
       let newMetadata: ViewMetadata = { ...currentMetadata };
+      // Track the ID of the most recently added view version in this update sequence.
+      // Per Iceberg spec, view-version-id=-1 means "use the version just added in this same request".
+      let lastAddedViewVersionId: number | null = null;
       if (body.updates) {
         for (const update of body.updates) {
           switch (update.action) {
@@ -2809,12 +2817,28 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
                   'version-id': newVersion['version-id'],
                 },
               ];
+              // Track this as the most recently added version for potential -1 reference
+              lastAddedViewVersionId = newVersion['version-id'];
               break;
             }
 
-            case 'set-current-view-version':
-              newMetadata['current-version-id'] = update['view-version-id'];
+            case 'set-current-view-version': {
+              let versionId = update['view-version-id'];
+              // Per Iceberg spec, -1 means "use the view version just added in this same request"
+              if (versionId === -1) {
+                if (lastAddedViewVersionId === null) {
+                  throw new Error('Cannot set current view version to -1: no view version was added in this update request');
+                }
+                versionId = lastAddedViewVersionId;
+              }
+              // Validate that the version ID exists in the versions array
+              const versionExists = newMetadata.versions.some(v => v['version-id'] === versionId);
+              if (!versionExists) {
+                throw new Error(`Cannot find version ${versionId} in view versions: [${newMetadata.versions.map(v => v['version-id']).join(', ')}]`);
+              }
+              newMetadata['current-version-id'] = versionId;
               break;
+            }
 
             case 'set-properties': {
               // Filter out reserved properties - these are not persisted
@@ -2932,21 +2956,22 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
       if (!response.ok) {
         const error = await response.json() as { error: string; code?: string };
+        // Check for namespace not found FIRST
+        // Must check before generic NOT_FOUND handling since NamespaceNotFoundError also has NOT_FOUND code
+        if (error.error?.includes('Namespace does not exist')) {
+          return icebergError(
+            c,
+            `Namespace does not exist: ${body.destination.namespace.join('.')}`,
+            'NoSuchNamespaceException',
+            404
+          );
+        }
         // Check for view not found
         if (error.error?.includes('View does not exist') || error.code === 'NOT_FOUND') {
           return icebergError(
             c,
             `View does not exist: ${body.source.namespace.join('.')}.${body.source.name}`,
             'NoSuchViewException',
-            404
-          );
-        }
-        // Check for namespace not found
-        if (error.error?.includes('Namespace does not exist')) {
-          return icebergError(
-            c,
-            `Namespace does not exist: ${body.destination.namespace.join('.')}`,
-            'NoSuchNamespaceException',
             404
           );
         }

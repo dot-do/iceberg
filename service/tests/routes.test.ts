@@ -1008,6 +1008,186 @@ describe('Iceberg REST Catalog Routes', () => {
         // Should contain specific message about field id, not generic conflict message
         expect(errorData.error.message).toContain('last assigned field id changed');
       });
+
+      it('should allow partition spec update then revert (testUpdateTableSpecThenRevert)', async () => {
+        // This test simulates the RCK testUpdateTableSpecThenRevert flow:
+        // 1. Create table with bucket partition spec
+        // 2. Add identity partition field
+        // 3. Remove that identity partition field (revert)
+
+        // Step 1: Create table with bucket("id", 16) partition spec
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'spec_revert_test',
+          'partition-spec': {
+            'spec-id': 0,
+            fields: [
+              { 'source-id': 1, 'field-id': 1000, name: 'id_bucket', transform: 'bucket[16]' },
+            ],
+          },
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+              { id: 2, name: 'data', required: false, type: 'string' },
+            ],
+          },
+          properties: { 'format-version': '2' },
+        });
+        expect(createRes.status).toBe(200);
+        const createData = await createRes.json() as { metadata: { 'table-uuid': string; 'last-partition-id': number; 'partition-specs': Array<{ 'spec-id': number; fields: Array<{ name: string }> }>; 'default-spec-id': number } };
+        const tableUuid = createData.metadata['table-uuid'];
+        const originalPartitionId = createData.metadata['last-partition-id'];
+
+        // Verify initial state
+        expect(createData.metadata['partition-specs']).toHaveLength(1);
+        expect(createData.metadata['partition-specs'][0].fields).toHaveLength(1);
+        expect(createData.metadata['partition-specs'][0].fields[0].name).toBe('id_bucket');
+        expect(createData.metadata['default-spec-id']).toBe(0);
+
+        // Step 2: Add identity partition field on "id" (like Java's updateSpec().addField("id"))
+        // This creates a NEW spec with both the bucket field and identity field
+        const addFieldRes = await request('POST', '/v1/namespaces/test_db/tables/spec_revert_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+            { type: 'assert-last-assigned-partition-id', 'last-assigned-partition-id': originalPartitionId },
+          ],
+          updates: [
+            {
+              action: 'add-spec',
+              spec: {
+                'spec-id': -1,
+                fields: [
+                  { 'source-id': 1, 'field-id': 1000, name: 'id_bucket', transform: 'bucket[16]' },
+                  { 'source-id': 1, 'field-id': 1001, name: 'id', transform: 'identity' },
+                ],
+              },
+            },
+            { action: 'set-default-spec', 'spec-id': -1 },
+          ],
+        });
+        expect(addFieldRes.status).toBe(200);
+        const addFieldData = await addFieldRes.json() as { metadata: { 'table-uuid': string; 'last-partition-id': number; 'partition-specs': Array<{ 'spec-id': number; fields: Array<{ name: string }> }>; 'default-spec-id': number } };
+
+        // Verify new spec was added with both fields
+        expect(addFieldData.metadata['partition-specs']).toHaveLength(2);
+        const newSpecId = addFieldData.metadata['default-spec-id'];
+        expect(newSpecId).toBe(1); // Should be new spec id
+
+        // Find the new spec (default spec) and verify it has both fields
+        const newSpec = addFieldData.metadata['partition-specs'].find(s => s['spec-id'] === newSpecId);
+        expect(newSpec).toBeDefined();
+        expect(newSpec!.fields).toHaveLength(2);
+        expect(newSpec!.fields.some(f => f.name === 'id_bucket')).toBe(true);
+        expect(newSpec!.fields.some(f => f.name === 'id')).toBe(true);
+
+        // Verify last-partition-id was updated
+        const updatedPartitionId = addFieldData.metadata['last-partition-id'];
+        expect(updatedPartitionId).toBeGreaterThanOrEqual(1001);
+
+        // Step 3: Remove identity partition field (like Java's updateSpec().removeField("id"))
+        // This creates ANOTHER new spec with only the bucket field
+        const removeFieldRes = await request('POST', '/v1/namespaces/test_db/tables/spec_revert_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+            { type: 'assert-last-assigned-partition-id', 'last-assigned-partition-id': updatedPartitionId },
+          ],
+          updates: [
+            {
+              action: 'add-spec',
+              spec: {
+                'spec-id': -1,
+                fields: [
+                  // Only the bucket field - identity field removed
+                  { 'source-id': 1, 'field-id': 1000, name: 'id_bucket', transform: 'bucket[16]' },
+                ],
+              },
+            },
+            { action: 'set-default-spec', 'spec-id': -1 },
+          ],
+        });
+        expect(removeFieldRes.status).toBe(200);
+        const removeFieldData = await removeFieldRes.json() as { metadata: { 'partition-specs': Array<{ 'spec-id': number; fields: Array<{ name: string }> }>; 'default-spec-id': number } };
+
+        // Verify we now have 3 specs total
+        expect(removeFieldData.metadata['partition-specs']).toHaveLength(3);
+
+        // Verify the new default spec only has the bucket field
+        const finalDefaultSpecId = removeFieldData.metadata['default-spec-id'];
+        expect(finalDefaultSpecId).toBe(2); // Should be newest spec id
+
+        const finalSpec = removeFieldData.metadata['partition-specs'].find(s => s['spec-id'] === finalDefaultSpecId);
+        expect(finalSpec).toBeDefined();
+        expect(finalSpec!.fields).toHaveLength(1);
+        expect(finalSpec!.fields[0].name).toBe('id_bucket');
+      });
+
+      it('should track previous metadata locations in metadata-log after commit (testMetadataFileLocationsRemovalAfterCommit)', async () => {
+        // This test validates that old metadata file locations are tracked in metadata-log
+        // for cleanup purposes, as required by the Iceberg spec.
+
+        // Step 1: Create table (metadata v1)
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'metadata_log_test',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+        expect(createRes.status).toBe(200);
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+        const initialMetadataLocation = createData['metadata-location'];
+
+        // Verify initial table has empty metadata-log
+        expect(createData.metadata['metadata-log']).toBeDefined();
+        expect(createData.metadata['metadata-log']).toHaveLength(0);
+
+        // Step 2: Update table (metadata v2) - add a property
+        const firstUpdateRes = await request('POST', '/v1/namespaces/test_db/tables/metadata_log_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            { action: 'set-properties', updates: { 'test.property': 'value1' } },
+          ],
+        });
+        expect(firstUpdateRes.status).toBe(200);
+        const firstUpdateData = await firstUpdateRes.json();
+        const secondMetadataLocation = firstUpdateData['metadata-location'];
+
+        // Step 3: Verify v1 metadata location is now in metadata-log
+        expect(firstUpdateData.metadata['metadata-log']).toBeDefined();
+        expect(firstUpdateData.metadata['metadata-log']).toHaveLength(1);
+        expect(firstUpdateData.metadata['metadata-log'][0]['metadata-file']).toBe(initialMetadataLocation);
+        expect(firstUpdateData.metadata['metadata-log'][0]['timestamp-ms']).toBeDefined();
+        expect(typeof firstUpdateData.metadata['metadata-log'][0]['timestamp-ms']).toBe('number');
+
+        // Step 4: Update table again (metadata v3) - add another property
+        const secondUpdateRes = await request('POST', '/v1/namespaces/test_db/tables/metadata_log_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            { action: 'set-properties', updates: { 'test.property2': 'value2' } },
+          ],
+        });
+        expect(secondUpdateRes.status).toBe(200);
+        const secondUpdateData = await secondUpdateRes.json();
+
+        // Step 5: Verify both v1 and v2 metadata locations are in metadata-log
+        expect(secondUpdateData.metadata['metadata-log']).toBeDefined();
+        expect(secondUpdateData.metadata['metadata-log']).toHaveLength(2);
+        expect(secondUpdateData.metadata['metadata-log'][0]['metadata-file']).toBe(initialMetadataLocation);
+        expect(secondUpdateData.metadata['metadata-log'][1]['metadata-file']).toBe(secondMetadataLocation);
+
+        // Step 6: Verify metadata locations are valid paths that can be used for cleanup
+        for (const entry of secondUpdateData.metadata['metadata-log']) {
+          expect(entry['metadata-file']).toMatch(/\.metadata\.json$/);
+          expect(entry['timestamp-ms']).toBeGreaterThan(0);
+        }
+      });
     });
   });
 
