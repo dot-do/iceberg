@@ -10,7 +10,8 @@ set -e
 
 # Configuration
 ICEBERG_DO_URL="${ICEBERG_DO_URL:-https://iceberg-do.dotdo.workers.dev}"
-ICEBERG_VERSION="${ICEBERG_VERSION:-1.7.1}"
+# Use main branch by default - it has better prefix/warehouse isolation support
+ICEBERG_VERSION="${ICEBERG_VERSION:-main}"
 WAREHOUSE="${WAREHOUSE:-rck-$(date +%s)}"
 
 echo "=============================================="
@@ -31,12 +32,16 @@ if java -version &>/dev/null; then
     trap "rm -rf $TEMP_DIR" EXIT
 
     # Clone iceberg repo (shallow)
-    echo "Cloning Apache Iceberg (shallow)..."
-    git clone --depth 1 --branch apache-iceberg-${ICEBERG_VERSION} \
-        https://github.com/apache/iceberg.git "$TEMP_DIR/iceberg" 2>/dev/null || {
-        echo "Using main branch..."
+    echo "Cloning Apache Iceberg (shallow) - branch: $ICEBERG_VERSION..."
+    if [ "$ICEBERG_VERSION" = "main" ]; then
         git clone --depth 1 https://github.com/apache/iceberg.git "$TEMP_DIR/iceberg"
-    }
+    else
+        git clone --depth 1 --branch apache-iceberg-${ICEBERG_VERSION} \
+            https://github.com/apache/iceberg.git "$TEMP_DIR/iceberg" 2>/dev/null || {
+            echo "Version not found, using main branch..."
+            git clone --depth 1 https://github.com/apache/iceberg.git "$TEMP_DIR/iceberg"
+        }
+    fi
 
     cd "$TEMP_DIR/iceberg"
 
@@ -62,12 +67,16 @@ elif command -v docker &>/dev/null; then
     trap "rm -rf $TEMP_DIR" EXIT
 
     # Clone iceberg repo (shallow)
-    echo "Cloning Apache Iceberg (shallow)..."
-    git clone --depth 1 --branch apache-iceberg-${ICEBERG_VERSION} \
-        https://github.com/apache/iceberg.git "$TEMP_DIR/iceberg" 2>/dev/null || {
-        echo "Using main branch..."
+    echo "Cloning Apache Iceberg (shallow) - branch: $ICEBERG_VERSION..."
+    if [ "$ICEBERG_VERSION" = "main" ]; then
         git clone --depth 1 https://github.com/apache/iceberg.git "$TEMP_DIR/iceberg"
-    }
+    else
+        git clone --depth 1 --branch apache-iceberg-${ICEBERG_VERSION} \
+            https://github.com/apache/iceberg.git "$TEMP_DIR/iceberg" 2>/dev/null || {
+            echo "Version not found, using main branch..."
+            git clone --depth 1 https://github.com/apache/iceberg.git "$TEMP_DIR/iceberg"
+        }
+    fi
 
     # Run Gradle inside Docker container
     echo ""

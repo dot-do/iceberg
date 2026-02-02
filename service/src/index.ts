@@ -85,7 +85,7 @@ app.use('/*', async (c, next) => {
 
   // Extract warehouse from multiple sources (in priority order):
   // 1. URL path prefix: /v1/ws/{warehouse}/... (returned by /v1/config as prefix)
-  // 2. Query parameter: ?warehouse=xxx (used in /v1/config calls)
+  // 2. Query parameter: ?warehouse=xxx (always checked, not just /v1/config)
   // 3. Header: X-Iceberg-Warehouse (custom extension)
   // 4. Default: 'default'
   let warehouse = 'default';
@@ -96,8 +96,11 @@ app.use('/*', async (c, next) => {
   if (prefixMatch) {
     warehouse = decodeURIComponent(prefixMatch[1]);
   } else {
-    // Fall back to query param or header
-    warehouse = c.req.query('warehouse') || c.req.header('X-Iceberg-Warehouse') || 'default';
+    // Fall back to query param (check on all requests, not just /v1/config)
+    // or header for custom clients
+    const warehouseParam = c.req.query('warehouse');
+    const warehouseHeader = c.req.header('X-Iceberg-Warehouse');
+    warehouse = warehouseParam || warehouseHeader || 'default';
   }
 
   if (backendType === 'd1') {
