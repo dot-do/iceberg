@@ -1,0 +1,18 @@
+{
+  "name": "iceberg-workspace",
+  "private": true,
+  "workspaces": [
+    "core",
+    "service"
+  ],
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "dev": "pnpm -r dev"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "packageManager": "pnpm@9.0.0"
+}

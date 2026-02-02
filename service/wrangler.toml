@@ -1,0 +1,61 @@
+name = "iceberg-do"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# Enable Durable Objects
+[durable_objects]
+bindings = [
+  { name = "CATALOG", class_name = "CatalogDO" }
+]
+
+# Define the Durable Object class
+[[migrations]]
+tag = "v1"
+new_classes = ["CatalogDO"]
+
+# R2 bucket for table data
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "iceberg-tables"
+
+# D1 database for catalog metadata (alternative to DO backend)
+# Uncomment and configure to use D1 instead of Durable Objects
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "iceberg-catalog"
+# database_id = "your-database-id"
+# migrations_dir = "migrations"
+
+# Service bindings - oauth.do for authentication
+# The OAUTH binding allows token validation via service-to-service calls
+# See https://oauth.do for documentation
+[[services]]
+binding = "OAUTH"
+service = "oauth-do"
+
+# Environment variables
+[vars]
+ENVIRONMENT = "development"
+AUTH_ENABLED = "false"
+AUTH_ALLOW_ANONYMOUS_READ = "true"
+# CATALOG_BACKEND = "durable-object"  # or "d1"
+
+# Optional: JWKS URI for direct JWT validation (when not using service binding)
+# OAUTH_JWKS_URI = "https://api.workos.com/sso/jwks/client_xxx"
+# OAUTH_CLIENT_ID = "your-workos-client-id"
+
+# Production environment - Durable Object backend (default)
+[env.production]
+vars = { ENVIRONMENT = "production", AUTH_ENABLED = "true", AUTH_ALLOW_ANONYMOUS_READ = "false", CATALOG_BACKEND = "durable-object" }
+
+# D1 backend environment (alternative production config)
+# Use this when you want global access and SQL queries across all catalogs
+[env.production-d1]
+vars = { ENVIRONMENT = "production", AUTH_ENABLED = "true", AUTH_ALLOW_ANONYMOUS_READ = "false", CATALOG_BACKEND = "d1" }
+
+# Example D1 configuration for production-d1 environment:
+# [[env.production-d1.d1_databases]]
+# binding = "DB"
+# database_name = "iceberg-catalog"
+# database_id = "your-production-database-id"
+# migrations_dir = "migrations"

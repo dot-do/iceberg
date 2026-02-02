@@ -1,0 +1,57 @@
+{
+  "name": "@dotdo/iceberg",
+  "version": "0.1.0",
+  "description": "Apache Iceberg table format for JavaScript/TypeScript",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./catalog": {
+      "types": "./dist/catalog/index.d.ts",
+      "import": "./dist/catalog/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src",
+    "prepublishOnly": "pnpm run build"
+  },
+  "keywords": [
+    "iceberg",
+    "apache-iceberg",
+    "lakehouse",
+    "data-lake",
+    "parquet",
+    "avro",
+    "catalog",
+    "cloudflare",
+    "r2"
+  ],
+  "author": "dotdo",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dot-do/iceberg"
+  },
+  "homepage": "https://iceberg.do",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
