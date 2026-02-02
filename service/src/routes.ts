@@ -59,6 +59,72 @@ interface RenameTableRequest {
   destination: { namespace: string[]; name: string };
 }
 
+/** Request body for rename view */
+interface RenameViewRequest {
+  source: { namespace: string[]; name: string };
+  destination: { namespace: string[]; name: string };
+}
+
+/** View representation (SQL query with dialect) */
+interface ViewRepresentation {
+  type: 'sql';
+  sql: string;
+  dialect: string;
+}
+
+/** View version */
+interface ViewVersion {
+  'version-id': number;
+  'schema-id': number;
+  'timestamp-ms': number;
+  summary: Record<string, string>;
+  representations: ViewRepresentation[];
+  'default-catalog'?: string;
+  'default-namespace'?: string[];
+}
+
+/** Request body for creating a view */
+interface CreateViewRequest {
+  name: string;
+  location?: string;
+  schema: IcebergSchema;
+  'view-version': ViewVersion;
+  properties?: Record<string, string>;
+}
+
+/** View metadata per Iceberg View spec */
+interface ViewMetadata {
+  'view-uuid': string;
+  'format-version': 1;
+  location: string;
+  'current-version-id': number;
+  versions: ViewVersion[];
+  'version-log': Array<{ 'timestamp-ms': number; 'version-id': number }>;
+  schemas: IcebergSchema[];
+  properties?: Record<string, string>;
+}
+
+/** Request body for replacing a view */
+interface ReplaceViewRequest {
+  identifier?: { namespace: string[]; name: string };
+  requirements?: ViewRequirement[];
+  updates?: ViewUpdate[];
+}
+
+/** View requirement for optimistic locking */
+type ViewRequirement =
+  | { type: 'assert-view-uuid'; uuid: string };
+
+/** View update operations */
+type ViewUpdate =
+  | { action: 'assign-uuid'; uuid: string }
+  | { action: 'set-location'; location: string }
+  | { action: 'add-schema'; schema: IcebergSchema }
+  | { action: 'add-view-version'; 'view-version': ViewVersion }
+  | { action: 'set-current-view-version'; 'view-version-id': number }
+  | { action: 'set-properties'; updates: Record<string, string> }
+  | { action: 'remove-properties'; removals: string[] };
+
 /** Request body for registering an existing table */
 interface RegisterTableRequest {
   name: string;
@@ -391,25 +457,111 @@ function normalizeType(type: string | IcebergSchema | IcebergListType | IcebergM
  * - Input schema with IDs 3, 4 → output schema with IDs 1, 2
  * - Input schema with IDs 100, 200 → output schema with IDs 1, 2
  * - Input schema with no IDs → output schema with IDs 1, 2
+ *
+ * Returns both the normalized schema and a mapping from old field IDs to new field IDs,
+ * which is used to update partition specs and sort orders.
  */
-function normalizeSchema(schema: IcebergSchema): IcebergSchema {
+function normalizeSchemaWithMapping(schema: IcebergSchema): { schema: IcebergSchema; idMapping: Map<number, number> } {
   // Always start field ID assignment from 1 for new tables
   const ctx: FieldIdContext = { nextId: 1 };
+  const idMapping = new Map<number, number>();
 
   const result: IcebergSchema = {
     type: 'struct',
-    fields: schema.fields.map(f => reassignField(f, ctx)),
+    fields: schema.fields.map(f => reassignFieldWithMapping(f, ctx, idMapping)),
   };
 
   if (schema['schema-id'] !== undefined) {
     result['schema-id'] = schema['schema-id'];
   }
   if (schema['identifier-field-ids'] !== undefined) {
-    // TODO: Map old identifier-field-ids to new IDs if needed
-    result['identifier-field-ids'] = [...schema['identifier-field-ids']];
+    // Map old identifier-field-ids to new IDs
+    result['identifier-field-ids'] = schema['identifier-field-ids']
+      .map(id => idMapping.get(id) ?? id);
   }
 
-  return result;
+  return { schema: result, idMapping };
+}
+
+/**
+ * Legacy function that returns only the normalized schema (for backward compatibility).
+ */
+function normalizeSchema(schema: IcebergSchema): IcebergSchema {
+  return normalizeSchemaWithMapping(schema).schema;
+}
+
+/**
+ * Reassign a field with a fresh ID, tracking the mapping from old ID to new ID.
+ */
+function reassignFieldWithMapping(field: IcebergField, ctx: FieldIdContext, idMapping: Map<number, number>): IcebergField {
+  const newId = ctx.nextId++;
+  idMapping.set(field.id, newId);
+
+  const copy: IcebergField = {
+    id: newId,
+    name: field.name,
+    required: field.required,
+    type: reassignTypeWithMapping(field.type, ctx, idMapping),
+  };
+  if (field.doc !== undefined) {
+    copy.doc = field.doc;
+  }
+  return copy;
+}
+
+/**
+ * Reassign IDs in a nested type, tracking the mapping.
+ */
+function reassignTypeWithMapping(type: string | IcebergSchema | IcebergListType | IcebergMapType, ctx: FieldIdContext, idMapping: Map<number, number>): string | IcebergSchema | IcebergListType | IcebergMapType {
+  if (typeof type === 'string') {
+    return type;
+  }
+
+  if ('fields' in type && type.type === 'struct') {
+    // It's a struct type
+    const result: IcebergSchema = {
+      type: 'struct',
+      fields: type.fields.map(f => reassignFieldWithMapping(f, ctx, idMapping)),
+    };
+    if (type['schema-id'] !== undefined) {
+      result['schema-id'] = type['schema-id'];
+    }
+    if (type['identifier-field-ids'] !== undefined) {
+      result['identifier-field-ids'] = type['identifier-field-ids']
+        .map(id => idMapping.get(id) ?? id);
+    }
+    return result;
+  }
+
+  if ('element-id' in type) {
+    // It's a list type
+    const newElementId = ctx.nextId++;
+    idMapping.set(type['element-id'], newElementId);
+    return {
+      type: 'list',
+      'element-id': newElementId,
+      element: reassignTypeWithMapping(type.element, ctx, idMapping),
+      'element-required': type['element-required'],
+    } as IcebergListType;
+  }
+
+  if ('key-id' in type) {
+    // It's a map type
+    const newKeyId = ctx.nextId++;
+    const newValueId = ctx.nextId++;
+    idMapping.set(type['key-id'], newKeyId);
+    idMapping.set(type['value-id'], newValueId);
+    return {
+      type: 'map',
+      'key-id': newKeyId,
+      key: reassignTypeWithMapping(type.key, ctx, idMapping),
+      'value-id': newValueId,
+      value: reassignTypeWithMapping(type.value, ctx, idMapping),
+      'value-required': type['value-required'],
+    } as IcebergMapType;
+  }
+
+  return type;
 }
 
 /**
@@ -500,10 +652,9 @@ function deepCopyType(type: string | IcebergSchema | IcebergListType | IcebergMa
 /**
  * Create default table metadata.
  *
- * This function normalizes the schema by:
- * - Preserving valid field IDs (positive integers) exactly as provided
- * - Assigning sequential IDs starting from 1 for fields without valid IDs
- * - Ensuring all nested types (lists, maps) have valid element/key/value IDs
+ * This function normalizes the schema by reassigning all field IDs sequentially
+ * starting from 1. The partition spec and sort order source-ids are updated
+ * to reference the new field IDs using the mapping from the normalization.
  */
 function createDefaultMetadata(
   tableUuid: string,
@@ -515,11 +666,8 @@ function createDefaultMetadata(
 ): TableMetadata {
   const now = Date.now();
 
-  // Normalize the schema: preserve valid IDs, assign sequential IDs where missing.
-  // Uses two-pass approach to avoid ID conflicts:
-  // 1. Find max existing valid ID in the schema
-  // 2. Assign new IDs starting from max+1 for fields without valid IDs
-  const normalizedSchema = normalizeSchema(schema);
+  // Normalize the schema and get the ID mapping
+  const { schema: normalizedSchema, idMapping } = normalizeSchemaWithMapping(schema);
 
   // Ensure schema-id is set (default to 0)
   if (normalizedSchema['schema-id'] === undefined) {
@@ -529,17 +677,63 @@ function createDefaultMetadata(
   // Find max field ID in schema (used for last-column-id tracking)
   const maxFieldId = findMaxFieldId(normalizedSchema);
 
-  // Default partition spec (unpartitioned)
-  const defaultPartitionSpec: PartitionSpec = partitionSpec ?? {
-    'spec-id': 0,
-    fields: [],
-  };
+  // Remap partition spec source-ids using the ID mapping
+  let remappedPartitionSpec: PartitionSpec;
+  if (partitionSpec && partitionSpec.fields.length > 0) {
+    const remappedFields = partitionSpec.fields.map(pf => {
+      const newSourceId = idMapping.get(pf['source-id']);
+      if (newSourceId === undefined) {
+        // Source ID not found in mapping - this partition field references an invalid column
+        console.warn(`Partition field references unknown source-id: ${pf['source-id']}`);
+        return null;
+      }
+      return {
+        ...pf,
+        'source-id': newSourceId,
+      };
+    }).filter((f): f is PartitionField => f !== null);
 
-  // Default sort order (unsorted)
-  const defaultSortOrder: SortOrder = sortOrder ?? {
-    'order-id': 0,
-    fields: [],
-  };
+    if (remappedFields.length > 0) {
+      remappedPartitionSpec = {
+        'spec-id': partitionSpec['spec-id'],
+        fields: remappedFields,
+      };
+    } else {
+      // All fields were invalid, fall back to unpartitioned
+      remappedPartitionSpec = { 'spec-id': 0, fields: [] };
+    }
+  } else {
+    remappedPartitionSpec = { 'spec-id': 0, fields: [] };
+  }
+
+  // Remap sort order source-ids using the ID mapping
+  let remappedSortOrder: SortOrder;
+  if (sortOrder && sortOrder.fields.length > 0) {
+    const remappedFields = sortOrder.fields.map(sf => {
+      const newSourceId = idMapping.get(sf['source-id']);
+      if (newSourceId === undefined) {
+        // Source ID not found in mapping - this sort field references an invalid column
+        console.warn(`Sort field references unknown source-id: ${sf['source-id']}`);
+        return null;
+      }
+      return {
+        ...sf,
+        'source-id': newSourceId,
+      };
+    }).filter((f): f is SortField => f !== null);
+
+    if (remappedFields.length > 0) {
+      remappedSortOrder = {
+        'order-id': sortOrder['order-id'],
+        fields: remappedFields,
+      };
+    } else {
+      // All fields were invalid, fall back to unsorted
+      remappedSortOrder = { 'order-id': 0, fields: [] };
+    }
+  } else {
+    remappedSortOrder = { 'order-id': 0, fields: [] };
+  }
 
   return {
     'format-version': 2,
@@ -550,11 +744,11 @@ function createDefaultMetadata(
     'last-column-id': maxFieldId,
     'current-schema-id': normalizedSchema['schema-id']!,
     schemas: [normalizedSchema],
-    'default-spec-id': defaultPartitionSpec['spec-id'],
-    'partition-specs': [defaultPartitionSpec],
-    'last-partition-id': findMaxPartitionFieldId(defaultPartitionSpec),
-    'default-sort-order-id': defaultSortOrder['order-id'],
-    'sort-orders': [defaultSortOrder],
+    'default-spec-id': remappedPartitionSpec['spec-id'],
+    'partition-specs': [remappedPartitionSpec],
+    'last-partition-id': findMaxPartitionFieldId(remappedPartitionSpec),
+    'default-sort-order-id': remappedSortOrder['order-id'],
+    'sort-orders': [remappedSortOrder],
     properties: properties ?? {},
     snapshots: [],
     'snapshot-log': [],
@@ -630,9 +824,11 @@ function applyUpdates(
 ): TableMetadata {
   let result = { ...metadata };
 
-  // Track the ID of the most recently added schema in this update sequence.
-  // Per Iceberg spec, schema-id=-1 in set-current-schema means "use the schema just added".
+  // Track the IDs of the most recently added entities in this update sequence.
+  // Per Iceberg spec, id=-1 means "use the entity just added in this same request".
   let lastAddedSchemaId: number | null = null;
+  let lastAddedSpecId: number | null = null;
+  let lastAddedSortOrderId: number | null = null;
 
   for (const update of updates) {
     switch (update.action) {
@@ -657,8 +853,16 @@ function applyUpdates(
         result.schemas = [...result.schemas, newSchema];
         // Track this as the most recently added schema for potential -1 reference
         lastAddedSchemaId = schemaId;
+
+        // Update last-column-id:
+        // - If explicitly provided in the update, use that value
+        // - Otherwise, calculate from the new schema's max field ID
         if (update['last-column-id'] !== undefined) {
           result['last-column-id'] = update['last-column-id'];
+        } else {
+          // Calculate max field ID from the added schema
+          const maxFieldIdInNewSchema = findMaxFieldId(newSchema as IcebergSchema);
+          result['last-column-id'] = Math.max(result['last-column-id'], maxFieldIdInNewSchema);
         }
         break;
       }
@@ -684,21 +888,50 @@ function applyUpdates(
         break;
       }
 
-      case 'add-spec':
+      case 'add-spec': {
+        const specId = update.spec['spec-id'];
         result['partition-specs'] = [...(result['partition-specs'] ?? []), update.spec];
+        // Track this as the most recently added spec for potential -1 reference
+        lastAddedSpecId = specId;
+        // Update last-partition-id to track the max partition field ID
+        const maxPartitionId = findMaxPartitionFieldId(update.spec);
+        result['last-partition-id'] = Math.max(result['last-partition-id'] ?? 999, maxPartitionId);
         break;
+      }
 
-      case 'set-default-spec':
-        result['default-spec-id'] = update['spec-id'];
+      case 'set-default-spec': {
+        let specId = update['spec-id'];
+        // Per Iceberg spec, -1 means "use the spec just added in this same request"
+        if (specId === -1) {
+          if (lastAddedSpecId === null) {
+            throw new Error('Cannot set default spec to -1: no spec was added in this update request');
+          }
+          specId = lastAddedSpecId;
+        }
+        result['default-spec-id'] = specId;
         break;
+      }
 
-      case 'add-sort-order':
+      case 'add-sort-order': {
+        const sortOrderId = update['sort-order']['order-id'];
         result['sort-orders'] = [...(result['sort-orders'] ?? []), update['sort-order']];
+        // Track this as the most recently added sort order for potential -1 reference
+        lastAddedSortOrderId = sortOrderId;
         break;
+      }
 
-      case 'set-default-sort-order':
-        result['default-sort-order-id'] = update['sort-order-id'];
+      case 'set-default-sort-order': {
+        let sortOrderId = update['sort-order-id'];
+        // Per Iceberg spec, -1 means "use the sort order just added in this same request"
+        if (sortOrderId === -1) {
+          if (lastAddedSortOrderId === null) {
+            throw new Error('Cannot set default sort order to -1: no sort order was added in this update request');
+          }
+          sortOrderId = lastAddedSortOrderId;
+        }
+        result['default-sort-order-id'] = sortOrderId;
         break;
+      }
 
       case 'add-snapshot': {
         const snapshot = update.snapshot;
@@ -862,9 +1095,19 @@ function validateRequirements(
  * - POST /namespaces/{namespace}/tables - Create table
  * - POST /namespaces/{namespace}/register - Register existing table
  * - GET /namespaces/{namespace}/tables/{table} - Load table
+ * - HEAD /namespaces/{namespace}/tables/{table} - Check table exists
  * - DELETE /namespaces/{namespace}/tables/{table} - Drop table
  * - POST /namespaces/{namespace}/tables/{table} - Commit table changes
  * - POST /tables/rename - Rename table
+ *
+ * View Endpoints:
+ * - GET /namespaces/{namespace}/views - List views
+ * - POST /namespaces/{namespace}/views - Create view
+ * - GET /namespaces/{namespace}/views/{view} - Load view
+ * - HEAD /namespaces/{namespace}/views/{view} - Check view exists
+ * - POST /namespaces/{namespace}/views/{view} - Replace view
+ * - DELETE /namespaces/{namespace}/views/{view} - Drop view
+ * - POST /views/rename - Rename view
  */
 export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextVariables }> {
   const api = new Hono<{ Bindings: Env; Variables: ContextVariables }>();
@@ -881,6 +1124,31 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       overrides: {
         // Properties that cannot be overridden by clients
       },
+      // Advertise supported endpoints so clients know what operations are available
+      endpoints: [
+        'GET /v1/{prefix}/namespaces',
+        'POST /v1/{prefix}/namespaces',
+        'GET /v1/{prefix}/namespaces/{namespace}',
+        'HEAD /v1/{prefix}/namespaces/{namespace}',
+        'DELETE /v1/{prefix}/namespaces/{namespace}',
+        'POST /v1/{prefix}/namespaces/{namespace}/properties',
+        'GET /v1/{prefix}/namespaces/{namespace}/tables',
+        'POST /v1/{prefix}/namespaces/{namespace}/tables',
+        'GET /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+        'HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+        'POST /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+        'DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+        'POST /v1/{prefix}/tables/rename',
+        'POST /v1/{prefix}/namespaces/{namespace}/register',
+        // View endpoints
+        'GET /v1/{prefix}/namespaces/{namespace}/views',
+        'POST /v1/{prefix}/namespaces/{namespace}/views',
+        'GET /v1/{prefix}/namespaces/{namespace}/views/{view}',
+        'HEAD /v1/{prefix}/namespaces/{namespace}/views/{view}',
+        'POST /v1/{prefix}/namespaces/{namespace}/views/{view}',
+        'DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}',
+        'POST /v1/{prefix}/views/rename',
+      ],
     });
   });
 
@@ -1163,8 +1431,38 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       // Normalize metadata to ensure required fields have valid values
       const normalizedMetadata = normalizeTableMetadata(metadata);
 
-      // Store table in catalog
       const catalog = getCatalogStub(c);
+
+      // If stage-create is true, don't create the table in the catalog yet.
+      // The table will be created when the transaction is committed.
+      // We still need to verify the namespace exists.
+      if (body['stage-create']) {
+        // Verify namespace exists
+        const nsResponse = await catalog.fetch(
+          new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}`)
+        );
+
+        if (!nsResponse.ok) {
+          return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
+        }
+
+        // Check if table already exists (should fail if it does)
+        const tableResponse = await catalog.fetch(
+          new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables/${encodeURIComponent(body.name)}`)
+        );
+
+        if (tableResponse.ok) {
+          return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+        }
+
+        // Return staged metadata without creating the table
+        return c.json({
+          'metadata-location': metadataLocation,
+          metadata: normalizedMetadata,
+        });
+      }
+
+      // Store table in catalog
       const response = await catalog.fetch(
         new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables`, {
           method: 'POST',
@@ -1188,14 +1486,6 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
         }
         throw new Error(error.error || 'Failed to create table');
-      }
-
-      // If stage-create is true, don't write metadata to storage yet
-      if (body['stage-create']) {
-        return c.json({
-          'metadata-location': metadataLocation,
-          metadata: normalizedMetadata,
-        });
       }
 
       // Write metadata to R2 if available
@@ -1386,12 +1676,35 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
       const catalog = getCatalogStub(c);
 
+      // Check if this is a create transaction (assert-create requirement)
+      const hasAssertCreate = (body.requirements ?? []).some(r => r.type === 'assert-create');
+
       // Load current table metadata
       const loadResponse = await catalog.fetch(
         new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables/${encodeURIComponent(tableName)}`)
       );
 
-      if (!loadResponse.ok) {
+      let currentMetadata: TableMetadata | null = null;
+      let tableData: { location: string; metadataLocation: string; metadata?: TableMetadata } | null = null;
+
+      if (loadResponse.ok) {
+        tableData = await loadResponse.json() as {
+          location: string;
+          metadataLocation: string;
+          metadata?: TableMetadata;
+        };
+        currentMetadata = tableData.metadata ?? null;
+
+        // Try to load from R2 if not in catalog
+        if (!currentMetadata && c.env.R2_BUCKET) {
+          const metadataPath = tableData.metadataLocation.replace('s3://iceberg-tables/', '');
+          const object = await c.env.R2_BUCKET.get(metadataPath);
+          if (object) {
+            currentMetadata = await object.json() as TableMetadata;
+          }
+        }
+      } else if (!hasAssertCreate) {
+        // Table doesn't exist and this isn't a create transaction
         return icebergError(
           c,
           `Table does not exist: ${namespace.join('.')}.${tableName}`,
@@ -1400,31 +1713,57 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         );
       }
 
-      const tableData = await loadResponse.json() as {
-        location: string;
-        metadataLocation: string;
-        metadata?: TableMetadata;
-      };
-
-      let currentMetadata = tableData.metadata;
-
-      // Try to load from R2 if not in catalog
-      if (!currentMetadata && c.env.R2_BUCKET) {
-        const metadataPath = tableData.metadataLocation.replace('s3://iceberg-tables/', '');
-        const object = await c.env.R2_BUCKET.get(metadataPath);
-        if (object) {
-          currentMetadata = await object.json() as TableMetadata;
-        }
-      }
-
       // Validate requirements
-      const validation = validateRequirements(currentMetadata ?? null, body.requirements ?? []);
+      const validation = validateRequirements(currentMetadata, body.requirements ?? []);
       if (!validation.valid) {
         return icebergError(c, validation.message!, 'CommitFailedException', 409);
       }
 
-      // Apply updates
-      const newMetadata = applyUpdates(currentMetadata!, body.updates ?? []);
+      // For create transactions, we need to build the initial metadata from the updates
+      let newMetadata: TableMetadata;
+      if (hasAssertCreate && currentMetadata === null) {
+        // This is a create transaction - build initial metadata from updates
+        // First, find the assign-uuid and set-location updates to get the basics
+        let tableUuid = crypto.randomUUID();
+        let tableLocation = '';
+        let initialSchema: IcebergSchema | null = null;
+
+        for (const update of body.updates ?? []) {
+          if (update.action === 'assign-uuid') {
+            tableUuid = update.uuid;
+          } else if (update.action === 'set-location') {
+            tableLocation = update.location;
+          } else if (update.action === 'add-schema') {
+            initialSchema = update.schema;
+          }
+        }
+
+        if (!tableLocation) {
+          // Default location if not provided
+          const warehousePrefix = c.env.R2_BUCKET ? 's3://iceberg-tables' : 'file:///warehouse';
+          tableLocation = `${warehousePrefix}/${namespace.join('/')}/${tableName}`;
+        }
+
+        if (!initialSchema) {
+          return icebergError(c, 'Cannot create table: no schema provided in updates', 'BadRequestException', 400);
+        }
+
+        // Create base metadata
+        const baseMetadata = createDefaultMetadata(
+          tableUuid,
+          tableLocation,
+          initialSchema,
+          undefined,
+          undefined,
+          {}
+        );
+
+        // Apply all updates to the base metadata
+        newMetadata = applyUpdates(baseMetadata, body.updates ?? []);
+      } else {
+        // Apply updates to existing metadata
+        newMetadata = applyUpdates(currentMetadata!, body.updates ?? []);
+      }
 
       // Generate new metadata location
       const seqNum = (newMetadata['last-sequence-number'] ?? 0).toString().padStart(5, '0');
@@ -1438,17 +1777,45 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         });
       }
 
-      // Update catalog with new metadata location
-      await catalog.fetch(
-        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables/${encodeURIComponent(tableName)}/commit`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            metadataLocation: newMetadataLocation,
-            metadata: newMetadata,
-          }),
-        })
-      );
+      if (hasAssertCreate && currentMetadata === null) {
+        // Create the table in the catalog
+        const createResponse = await catalog.fetch(
+          new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: tableName,
+              location: newMetadata.location,
+              metadataLocation: newMetadataLocation,
+              metadata: newMetadata,
+              properties: newMetadata.properties ?? {},
+            }),
+          })
+        );
+
+        if (!createResponse.ok) {
+          const error = await createResponse.json() as { error: string };
+          if (createResponse.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('already exists')) {
+            return icebergError(c, `Table already exists: ${namespace.join('.')}.${tableName}`, 'AlreadyExistsException', 409);
+          }
+          if (createResponse.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
+            return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
+          }
+          throw new Error(error.error || 'Failed to create table');
+        }
+      } else {
+        // Update catalog with new metadata location
+        await catalog.fetch(
+          new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables/${encodeURIComponent(tableName)}/commit`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              metadataLocation: newMetadataLocation,
+              metadata: newMetadata,
+            }),
+          })
+        );
+      }
 
       return c.json({
         'metadata-location': newMetadataLocation,
@@ -1490,8 +1857,19 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       );
 
       if (!response.ok) {
-        const error = await response.json() as { error: string };
-        if (error.error?.includes('not found') || error.error?.includes('does not exist')) {
+        const error = await response.json() as { error: string; code?: string };
+        // Check for namespace not found (destination namespace missing)
+        // The DO returns "Namespace does not exist:" in the error message
+        if (error.error?.includes('Namespace does not exist')) {
+          return icebergError(
+            c,
+            `Namespace does not exist: ${body.destination.namespace.join('.')}`,
+            'NoSuchNamespaceException',
+            404
+          );
+        }
+        // Check for table not found (source table missing)
+        if (error.error?.includes('Table does not exist')) {
           return icebergError(
             c,
             `Table does not exist: ${body.source.namespace.join('.')}.${body.source.name}`,
@@ -1603,6 +1981,422 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to register table',
+        'ServiceFailureException',
+        500
+      );
+    }
+  });
+
+  // ===========================================================================
+  // View Routes
+  // ===========================================================================
+
+  // -------------------------------------------------------------------------
+  // GET /namespaces/{namespace}/views - List views in namespace
+  // -------------------------------------------------------------------------
+  api.get('/namespaces/:namespace/views', requireTablePermission('table:list'), async (c) => {
+    try {
+      const namespaceParam = c.req.param('namespace');
+      const namespace = parseNamespace(namespaceParam);
+
+      const catalog = getCatalogStub(c);
+      const response = await catalog.fetch(
+        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/views`)
+      );
+
+      if (!response.ok) {
+        return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
+      }
+
+      const data = await response.json() as { identifiers: Array<{ namespace: string[]; name: string }> };
+
+      return c.json({
+        identifiers: (data.identifiers ?? []).map(v => ({
+          namespace: v.namespace,
+          name: v.name,
+        })),
+      });
+    } catch (error) {
+      return icebergError(
+        c,
+        error instanceof Error ? error.message : 'Failed to list views',
+        'ServiceFailureException',
+        500
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /namespaces/{namespace}/views - Create view
+  // -------------------------------------------------------------------------
+  api.post('/namespaces/:namespace/views', requireTablePermission('table:create'), async (c) => {
+    try {
+      const namespaceParam = c.req.param('namespace');
+      const namespace = parseNamespace(namespaceParam);
+      const body = await c.req.json() as CreateViewRequest;
+
+      if (!body.name) {
+        return icebergError(c, 'View name is required', 'BadRequestException', 400);
+      }
+
+      if (!body.schema) {
+        return icebergError(c, 'Schema is required', 'BadRequestException', 400);
+      }
+
+      if (!body['view-version']) {
+        return icebergError(c, 'View version is required', 'BadRequestException', 400);
+      }
+
+      // Generate view UUID
+      const viewUuid = crypto.randomUUID();
+
+      // Determine view location
+      const warehousePrefix = c.env.R2_BUCKET ? 's3://iceberg-tables' : 'file:///warehouse';
+      const viewLocation = body.location ?? `${warehousePrefix}/${namespace.join('/')}/views/${body.name}`;
+
+      // Normalize the schema
+      const normalizedSchema = normalizeSchema(body.schema);
+      if (normalizedSchema['schema-id'] === undefined) {
+        normalizedSchema['schema-id'] = body.schema['schema-id'] ?? 0;
+      }
+
+      // Create initial view metadata
+      const now = Date.now();
+      const viewVersion: ViewVersion = {
+        ...body['view-version'],
+        'version-id': body['view-version']['version-id'] ?? 1,
+        'timestamp-ms': body['view-version']['timestamp-ms'] ?? now,
+        'schema-id': normalizedSchema['schema-id']!,
+      };
+
+      const viewMetadata: ViewMetadata = {
+        'view-uuid': viewUuid,
+        'format-version': 1,
+        location: viewLocation,
+        'current-version-id': viewVersion['version-id'],
+        versions: [viewVersion],
+        'version-log': [
+          {
+            'timestamp-ms': viewVersion['timestamp-ms'],
+            'version-id': viewVersion['version-id'],
+          },
+        ],
+        schemas: [normalizedSchema],
+        properties: body.properties ?? {},
+      };
+
+      // Store view in catalog
+      const catalog = getCatalogStub(c);
+      const response = await catalog.fetch(
+        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/views`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: body.name,
+            metadata: viewMetadata,
+          }),
+        })
+      );
+
+      if (!response.ok) {
+        const error = await response.json() as { error: string };
+        if (response.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('already exists')) {
+          return icebergError(c, `View already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+        }
+        if (response.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
+          return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
+        }
+        throw new Error(error.error || 'Failed to create view');
+      }
+
+      // Generate metadata location for the view
+      const metadataLocation = `${viewMetadata.location}/metadata/v${viewMetadata['current-version-id']}.metadata.json`;
+
+      return c.json({
+        'metadata-location': metadataLocation,
+        metadata: viewMetadata,
+      }, 200);
+    } catch (error) {
+      if (error instanceof Response) throw error;
+      return icebergError(
+        c,
+        error instanceof Error ? error.message : 'Failed to create view',
+        'ServiceFailureException',
+        500
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // GET/HEAD /namespaces/{namespace}/views/{view} - Load view / Check exists
+  // -------------------------------------------------------------------------
+  api.on(['GET', 'HEAD'], '/namespaces/:namespace/views/:view', requireTablePermission('table:read'), async (c) => {
+    try {
+      const namespaceParam = c.req.param('namespace');
+      const viewName = c.req.param('view');
+      const namespace = parseNamespace(namespaceParam);
+
+      const catalog = getCatalogStub(c);
+      const response = await catalog.fetch(
+        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/views/${encodeURIComponent(viewName)}`)
+      );
+
+      if (!response.ok) {
+        // HEAD returns 404, GET returns error JSON
+        if (c.req.method === 'HEAD') {
+          return c.body(null, 404);
+        }
+        return icebergError(
+          c,
+          `View does not exist: ${namespace.join('.')}.${viewName}`,
+          'NoSuchViewException',
+          404
+        );
+      }
+
+      // HEAD returns 204 No Content
+      if (c.req.method === 'HEAD') {
+        return c.body(null, 204);
+      }
+
+      const data = await response.json() as { metadata: ViewMetadata };
+
+      // Generate metadata location for the view
+      const viewLocation = data.metadata.location || `s3://iceberg-tables/${namespace.join('/')}/views/${viewName}`;
+      const metadataLocation = `${viewLocation}/metadata/v${data.metadata['current-version-id']}.metadata.json`;
+
+      return c.json({
+        'metadata-location': metadataLocation,
+        metadata: data.metadata,
+      });
+    } catch (error) {
+      if (c.req.method === 'HEAD') {
+        return c.body(null, 500);
+      }
+      return icebergError(
+        c,
+        error instanceof Error ? error.message : 'Failed to load view',
+        'ServiceFailureException',
+        500
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /namespaces/{namespace}/views/{view} - Replace view
+  // -------------------------------------------------------------------------
+  api.post('/namespaces/:namespace/views/:view', requireTablePermission('table:commit'), async (c) => {
+    try {
+      const namespaceParam = c.req.param('namespace');
+      const viewName = c.req.param('view');
+      const namespace = parseNamespace(namespaceParam);
+      const body = await c.req.json() as ReplaceViewRequest;
+
+      const catalog = getCatalogStub(c);
+
+      // Load current view metadata
+      const loadResponse = await catalog.fetch(
+        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/views/${encodeURIComponent(viewName)}`)
+      );
+
+      if (!loadResponse.ok) {
+        return icebergError(
+          c,
+          `View does not exist: ${namespace.join('.')}.${viewName}`,
+          'NoSuchViewException',
+          404
+        );
+      }
+
+      const viewData = await loadResponse.json() as { metadata: ViewMetadata };
+      let currentMetadata = viewData.metadata;
+
+      // Validate requirements
+      if (body.requirements) {
+        for (const req of body.requirements) {
+          if (req.type === 'assert-view-uuid' && currentMetadata['view-uuid'] !== req.uuid) {
+            return icebergError(
+              c,
+              `View UUID mismatch: expected ${req.uuid}, got ${currentMetadata['view-uuid']}`,
+              'CommitFailedException',
+              409
+            );
+          }
+        }
+      }
+
+      // Apply updates
+      let newMetadata: ViewMetadata = { ...currentMetadata };
+      if (body.updates) {
+        for (const update of body.updates) {
+          switch (update.action) {
+            case 'assign-uuid':
+              newMetadata['view-uuid'] = update.uuid;
+              break;
+
+            case 'set-location':
+              newMetadata.location = update.location;
+              break;
+
+            case 'add-schema': {
+              const schemaId = update.schema['schema-id'] ?? newMetadata.schemas.length;
+              const newSchema = { ...update.schema, 'schema-id': schemaId };
+              newMetadata.schemas = [...newMetadata.schemas, newSchema];
+              break;
+            }
+
+            case 'add-view-version': {
+              const newVersion = update['view-version'];
+              newMetadata.versions = [...newMetadata.versions, newVersion];
+              newMetadata['version-log'] = [
+                ...newMetadata['version-log'],
+                {
+                  'timestamp-ms': newVersion['timestamp-ms'],
+                  'version-id': newVersion['version-id'],
+                },
+              ];
+              break;
+            }
+
+            case 'set-current-view-version':
+              newMetadata['current-version-id'] = update['view-version-id'];
+              break;
+
+            case 'set-properties':
+              newMetadata.properties = { ...(newMetadata.properties ?? {}), ...update.updates };
+              break;
+
+            case 'remove-properties':
+              newMetadata.properties = Object.fromEntries(
+                Object.entries(newMetadata.properties ?? {}).filter(
+                  ([key]) => !update.removals.includes(key)
+                )
+              );
+              break;
+          }
+        }
+      }
+
+      // Update view in catalog
+      const updateResponse = await catalog.fetch(
+        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/views/${encodeURIComponent(viewName)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            metadata: newMetadata,
+          }),
+        })
+      );
+
+      if (!updateResponse.ok) {
+        const error = await updateResponse.json() as { error: string };
+        throw new Error(error.error || 'Failed to replace view');
+      }
+
+      // Generate metadata location for the view
+      const metadataLocation = `${newMetadata.location}/metadata/v${newMetadata['current-version-id']}.metadata.json`;
+
+      return c.json({
+        'metadata-location': metadataLocation,
+        metadata: newMetadata,
+      });
+    } catch (error) {
+      return icebergError(
+        c,
+        error instanceof Error ? error.message : 'Failed to replace view',
+        'ServiceFailureException',
+        500
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // DELETE /namespaces/{namespace}/views/{view} - Drop view
+  // -------------------------------------------------------------------------
+  api.delete('/namespaces/:namespace/views/:view', requireTablePermission('table:drop'), async (c) => {
+    try {
+      const namespaceParam = c.req.param('namespace');
+      const viewName = c.req.param('view');
+      const namespace = parseNamespace(namespaceParam);
+
+      const catalog = getCatalogStub(c);
+      const response = await catalog.fetch(
+        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/views/${encodeURIComponent(viewName)}`, {
+          method: 'DELETE',
+        })
+      );
+
+      if (!response.ok) {
+        return icebergError(
+          c,
+          `View does not exist: ${namespace.join('.')}.${viewName}`,
+          'NoSuchViewException',
+          404
+        );
+      }
+
+      return c.body(null, 204);
+    } catch (error) {
+      return icebergError(
+        c,
+        error instanceof Error ? error.message : 'Failed to drop view',
+        'ServiceFailureException',
+        500
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /views/rename - Rename view
+  // -------------------------------------------------------------------------
+  api.post('/views/rename', requireTablePermission('table:rename'), async (c) => {
+    try {
+      const body = await c.req.json() as RenameViewRequest;
+
+      if (!body.source || !body.destination) {
+        return icebergError(c, 'Source and destination are required', 'BadRequestException', 400);
+      }
+
+      const catalog = getCatalogStub(c);
+      const response = await catalog.fetch(
+        new Request('http://internal/views/rename', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fromNamespace: body.source.namespace,
+            fromName: body.source.name,
+            toNamespace: body.destination.namespace,
+            toName: body.destination.name,
+          }),
+        })
+      );
+
+      if (!response.ok) {
+        const error = await response.json() as { error: string };
+        if (error.error?.includes('not found') || error.error?.includes('does not exist')) {
+          return icebergError(
+            c,
+            `View does not exist: ${body.source.namespace.join('.')}.${body.source.name}`,
+            'NoSuchViewException',
+            404
+          );
+        }
+        if (error.error?.includes('already exists')) {
+          return icebergError(
+            c,
+            `View already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
+            'AlreadyExistsException',
+            409
+          );
+        }
+        throw new Error(error.error || 'Failed to rename view');
+      }
+
+      return c.body(null, 204);
+    } catch (error) {
+      return icebergError(
+        c,
+        error instanceof Error ? error.message : 'Failed to rename view',
         'ServiceFailureException',
         500
       );

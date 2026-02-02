@@ -100,6 +100,30 @@ export class TableAlreadyExistsError extends CatalogError {
   }
 }
 
+/** View not found error */
+export class ViewNotFoundError extends CatalogError {
+  constructor(namespace: string[], name: string) {
+    super(
+      `View does not exist: ${namespace.join('.')}.${name}`,
+      CatalogErrorCode.NOT_FOUND,
+      404
+    );
+    this.name = 'ViewNotFoundError';
+  }
+}
+
+/** View already exists error */
+export class ViewAlreadyExistsError extends CatalogError {
+  constructor(namespace: string[], name: string) {
+    super(
+      `View already exists: ${namespace.join('.')}.${name}`,
+      CatalogErrorCode.ALREADY_EXISTS,
+      409
+    );
+    this.name = 'ViewAlreadyExistsError';
+  }
+}
+
 /** Concurrency conflict error (OCC) */
 export class ConcurrencyConflictError extends CatalogError {
   constructor(message: string) {
@@ -127,6 +151,46 @@ export interface NamespaceData {
   properties: Record<string, string>;
   createdAt: number;
   updatedAt: number;
+}
+
+// ============================================================================
+// View Types (per Iceberg spec)
+// ============================================================================
+
+/** View representation (SQL definition) */
+export interface ViewRepresentation {
+  type: 'sql';
+  sql: string;
+  dialect: string;
+}
+
+/** View version entry */
+export interface ViewVersion {
+  'version-id': number;
+  'schema-id': number;
+  'timestamp-ms': number;
+  summary: Record<string, string>;
+  representations: ViewRepresentation[];
+  'default-catalog'?: string;
+  'default-namespace'?: string[];
+}
+
+/** Version log entry */
+export interface VersionLogEntry {
+  'version-id': number;
+  'timestamp-ms': number;
+}
+
+/** View metadata per Iceberg spec */
+export interface ViewMetadata {
+  'view-uuid': string;
+  'format-version': number; // Always 1 for views
+  location: string;
+  'current-version-id': number;
+  versions: ViewVersion[];
+  'version-log': VersionLogEntry[];
+  schemas: unknown[]; // Schema objects
+  properties?: Record<string, string>;
 }
 
 /** Cache entry with TTL */
@@ -234,6 +298,9 @@ export class CatalogDO extends DurableObject<Env> {
   /** LRU cache for table metadata */
   private tableCache: LRUCache<string, TableData>;
 
+  /** LRU cache for view metadata */
+  private viewCache: LRUCache<string, ViewMetadata>;
+
   /** Cache TTL in milliseconds (1 minute) */
   private static readonly CACHE_TTL = 60000;
 
@@ -247,6 +314,7 @@ export class CatalogDO extends DurableObject<Env> {
     // Initialize caches
     this.namespaceCache = new LRUCache(CatalogDO.CACHE_SIZE, CatalogDO.CACHE_TTL);
     this.tableCache = new LRUCache(CatalogDO.CACHE_SIZE, CatalogDO.CACHE_TTL);
+    this.viewCache = new LRUCache(CatalogDO.CACHE_SIZE, CatalogDO.CACHE_TTL);
   }
 
   // ==========================================================================
@@ -306,6 +374,28 @@ export class CatalogDO extends DurableObject<Env> {
     // Index for namespace prefix queries (hierarchical namespaces)
     this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_namespaces_prefix ON namespaces(namespace)
+    `);
+
+    // Create views table
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS views (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        namespace TEXT NOT NULL,
+        name TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+        updated_at INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+        UNIQUE(namespace, name)
+      )
+    `);
+
+    // Create indexes for views
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_views_namespace ON views(namespace)
+    `);
+
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_views_ns_name ON views(namespace, name)
     `);
 
     this.initialized = true;
@@ -582,6 +672,16 @@ export class CatalogDO extends DurableObject<Env> {
     );
 
     if (tableCount.toArray()[0].count > 0) {
+      throw new NamespaceNotEmptyError(namespace);
+    }
+
+    // Check if namespace has views
+    const viewCount = this.sql.exec<{ count: number }>(
+      `SELECT COUNT(*) as count FROM views WHERE namespace = ?`,
+      namespaceKey
+    );
+
+    if (viewCount.toArray()[0].count > 0) {
       throw new NamespaceNotEmptyError(namespace);
     }
 
@@ -919,6 +1019,250 @@ export class CatalogDO extends DurableObject<Env> {
   }
 
   // ==========================================================================
+  // View Operations
+  // ==========================================================================
+
+  /**
+   * Get cache key for a view.
+   */
+  private getViewCacheKey(namespace: string[], name: string): string {
+    return `${namespace.join('\x1f')}\x00${name}`;
+  }
+
+  /**
+   * List views in a namespace.
+   */
+  async listViews(namespace: string[]): Promise<{ identifiers: Array<{ namespace: string[]; name: string }> }> {
+    await this.init();
+
+    const namespaceKey = namespace.join('\x1f');
+    const results = this.sql.exec<{ namespace: string; name: string }>(
+      `SELECT namespace, name FROM views WHERE namespace = ? ORDER BY name`,
+      namespaceKey
+    );
+
+    return {
+      identifiers: results.toArray().map((row) => ({
+        namespace: row.namespace.split('\x1f'),
+        name: row.name,
+      })),
+    };
+  }
+
+  /**
+   * Create a view.
+   * @throws NamespaceNotFoundError if namespace doesn't exist
+   * @throws ViewAlreadyExistsError if view already exists
+   */
+  async createView(
+    namespace: string[],
+    name: string,
+    metadata: ViewMetadata
+  ): Promise<ViewMetadata> {
+    await this.init();
+
+    const namespaceKey = namespace.join('\x1f');
+
+    // Check namespace exists
+    const nsExists = await this.namespaceExists(namespace);
+    if (!nsExists) {
+      throw new NamespaceNotFoundError(namespace);
+    }
+
+    const now = Date.now();
+
+    try {
+      this.sql.exec(
+        `INSERT INTO views (namespace, name, metadata, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        namespaceKey,
+        name,
+        JSON.stringify(metadata),
+        now,
+        now
+      );
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('UNIQUE constraint')) {
+        throw new ViewAlreadyExistsError(namespace, name);
+      }
+      throw error;
+    }
+
+    // Update cache
+    this.viewCache.set(this.getViewCacheKey(namespace, name), metadata);
+
+    return metadata;
+  }
+
+  /**
+   * Load view metadata.
+   * Returns null if view doesn't exist.
+   */
+  async loadView(namespace: string[], name: string): Promise<ViewMetadata | null> {
+    await this.init();
+
+    const cacheKey = this.getViewCacheKey(namespace, name);
+
+    // Check cache first
+    const cached = this.viewCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const namespaceKey = namespace.join('\x1f');
+    const results = this.sql.exec<{ metadata: string }>(
+      `SELECT metadata FROM views WHERE namespace = ? AND name = ?`,
+      namespaceKey,
+      name
+    );
+
+    const rows = results.toArray();
+    if (rows.length === 0) return null;
+
+    const metadata = JSON.parse(rows[0].metadata) as ViewMetadata;
+
+    // Update cache
+    this.viewCache.set(cacheKey, metadata);
+
+    return metadata;
+  }
+
+  /**
+   * Replace/update view metadata.
+   * @throws ViewNotFoundError if view doesn't exist
+   */
+  async replaceView(
+    namespace: string[],
+    name: string,
+    metadata: ViewMetadata
+  ): Promise<ViewMetadata> {
+    await this.init();
+
+    const namespaceKey = namespace.join('\x1f');
+    const cacheKey = this.getViewCacheKey(namespace, name);
+    const now = Date.now();
+
+    const result = this.sql.exec(
+      `UPDATE views SET metadata = ?, updated_at = ?
+       WHERE namespace = ? AND name = ?`,
+      JSON.stringify(metadata),
+      now,
+      namespaceKey,
+      name
+    );
+
+    if (result.rowsWritten === 0) {
+      throw new ViewNotFoundError(namespace, name);
+    }
+
+    // Update cache
+    this.viewCache.set(cacheKey, metadata);
+
+    return metadata;
+  }
+
+  /**
+   * Delete a view.
+   * @throws ViewNotFoundError if view doesn't exist
+   */
+  async deleteView(namespace: string[], name: string): Promise<boolean> {
+    await this.init();
+
+    const namespaceKey = namespace.join('\x1f');
+    const cacheKey = this.getViewCacheKey(namespace, name);
+
+    const result = this.sql.exec(
+      `DELETE FROM views WHERE namespace = ? AND name = ?`,
+      namespaceKey,
+      name
+    );
+
+    if (result.rowsWritten === 0) {
+      throw new ViewNotFoundError(namespace, name);
+    }
+
+    // Invalidate cache
+    this.viewCache.delete(cacheKey);
+
+    return true;
+  }
+
+  /**
+   * Check if a view exists.
+   */
+  async viewExists(namespace: string[], name: string): Promise<boolean> {
+    await this.init();
+
+    const cacheKey = this.getViewCacheKey(namespace, name);
+    if (this.viewCache.has(cacheKey)) {
+      return true;
+    }
+
+    const namespaceKey = namespace.join('\x1f');
+    const results = this.sql.exec<{ count: number }>(
+      `SELECT COUNT(*) as count FROM views WHERE namespace = ? AND name = ?`,
+      namespaceKey,
+      name
+    );
+
+    return results.toArray()[0].count > 0;
+  }
+
+  /**
+   * Rename a view.
+   * @throws ViewNotFoundError if source view doesn't exist
+   * @throws NamespaceNotFoundError if destination namespace doesn't exist
+   * @throws ViewAlreadyExistsError if destination view already exists
+   */
+  async renameView(
+    sourceNamespace: string[],
+    sourceName: string,
+    destNamespace: string[],
+    destName: string
+  ): Promise<void> {
+    await this.init();
+
+    const sourceKey = sourceNamespace.join('\x1f');
+    const destKey = destNamespace.join('\x1f');
+
+    await this.transaction(async () => {
+      // Check source view exists
+      const source = await this.loadView(sourceNamespace, sourceName);
+      if (!source) {
+        throw new ViewNotFoundError(sourceNamespace, sourceName);
+      }
+
+      // Check destination namespace exists
+      const destNsExists = await this.namespaceExists(destNamespace);
+      if (!destNsExists) {
+        throw new NamespaceNotFoundError(destNamespace);
+      }
+
+      // Check destination view doesn't exist
+      const destExists = await this.viewExists(destNamespace, destName);
+      if (destExists) {
+        throw new ViewAlreadyExistsError(destNamespace, destName);
+      }
+
+      const now = Date.now();
+
+      this.sql.exec(
+        `UPDATE views SET namespace = ?, name = ?, updated_at = ?
+         WHERE namespace = ? AND name = ?`,
+        destKey,
+        destName,
+        now,
+        sourceKey,
+        sourceName
+      );
+
+      // Invalidate caches
+      this.viewCache.delete(this.getViewCacheKey(sourceNamespace, sourceName));
+      this.viewCache.delete(this.getViewCacheKey(destNamespace, destName));
+    });
+  }
+
+  // ==========================================================================
   // Cache Management
   // ==========================================================================
 
@@ -928,6 +1272,7 @@ export class CatalogDO extends DurableObject<Env> {
   clearCaches(): void {
     this.namespaceCache.clear();
     this.tableCache.clear();
+    this.viewCache.clear();
   }
 
   /**
@@ -1106,8 +1451,107 @@ export class CatalogDO extends DurableObject<Env> {
       }
 
       // =====================================================================
+      // View operations
+      // =====================================================================
+
+      // GET /namespaces/{namespace}/views - List views
+      const listViewsMatch = path.match(/^\/namespaces\/([^/]+)\/views$/);
+      if (request.method === 'GET' && listViewsMatch) {
+        const namespaceKey = decodeURIComponent(listViewsMatch[1]);
+        const namespace = namespaceKey.split('\x1f');
+
+        // Check namespace exists
+        const exists = await this.namespaceExists(namespace);
+        if (!exists) {
+          throw new NamespaceNotFoundError(namespace);
+        }
+
+        const result = await this.listViews(namespace);
+        return Response.json(result);
+      }
+
+      // POST /namespaces/{namespace}/views - Create view
+      const createViewMatch = path.match(/^\/namespaces\/([^/]+)\/views$/);
+      if (request.method === 'POST' && createViewMatch) {
+        const namespaceKey = decodeURIComponent(createViewMatch[1]);
+        const namespace = namespaceKey.split('\x1f');
+        const body = (await request.json()) as {
+          name: string;
+          metadata: ViewMetadata;
+        };
+        const metadata = await this.createView(namespace, body.name, body.metadata);
+        return Response.json({ metadata });
+      }
+
+      // HEAD /namespaces/{namespace}/views/{view} - Check view exists
+      const headViewMatch = path.match(/^\/namespaces\/([^/]+)\/views\/([^/]+)$/);
+      if (request.method === 'HEAD' && headViewMatch) {
+        const namespaceKey = decodeURIComponent(headViewMatch[1]);
+        const viewName = decodeURIComponent(headViewMatch[2]);
+        const namespace = namespaceKey.split('\x1f');
+        const exists = await this.viewExists(namespace, viewName);
+        if (!exists) {
+          return new Response(null, { status: 404 });
+        }
+        return new Response(null, { status: 200 });
+      }
+
+      // GET /namespaces/{namespace}/views/{view} - Load view
+      const getViewMatch = path.match(/^\/namespaces\/([^/]+)\/views\/([^/]+)$/);
+      if (request.method === 'GET' && getViewMatch) {
+        const namespaceKey = decodeURIComponent(getViewMatch[1]);
+        const viewName = decodeURIComponent(getViewMatch[2]);
+        const namespace = namespaceKey.split('\x1f');
+        const metadata = await this.loadView(namespace, viewName);
+        if (!metadata) {
+          throw new ViewNotFoundError(namespace, viewName);
+        }
+        return Response.json({ metadata });
+      }
+
+      // POST /namespaces/{namespace}/views/{view} - Replace view (when view exists)
+      const replaceViewMatch = path.match(/^\/namespaces\/([^/]+)\/views\/([^/]+)$/);
+      if (request.method === 'POST' && replaceViewMatch) {
+        const namespaceKey = decodeURIComponent(replaceViewMatch[1]);
+        const viewName = decodeURIComponent(replaceViewMatch[2]);
+        const namespace = namespaceKey.split('\x1f');
+        const body = (await request.json()) as {
+          metadata: ViewMetadata;
+        };
+        const metadata = await this.replaceView(namespace, viewName, body.metadata);
+        return Response.json({ metadata });
+      }
+
+      // DELETE /namespaces/{namespace}/views/{view} - Delete view
+      const deleteViewMatch = path.match(/^\/namespaces\/([^/]+)\/views\/([^/]+)$/);
+      if (request.method === 'DELETE' && deleteViewMatch) {
+        const namespaceKey = decodeURIComponent(deleteViewMatch[1]);
+        const viewName = decodeURIComponent(deleteViewMatch[2]);
+        const namespace = namespaceKey.split('\x1f');
+        await this.deleteView(namespace, viewName);
+        return new Response(null, { status: 204 });
+      }
+
+      // =====================================================================
       // Cross-namespace operations
       // =====================================================================
+
+      // POST /views/rename - Rename view
+      if (request.method === 'POST' && path === '/views/rename') {
+        const body = (await request.json()) as {
+          sourceNamespace: string[];
+          sourceName: string;
+          destNamespace: string[];
+          destName: string;
+        };
+        await this.renameView(
+          body.sourceNamespace,
+          body.sourceName,
+          body.destNamespace,
+          body.destName
+        );
+        return new Response(null, { status: 204 });
+      }
 
       // POST /tables/rename - Rename table
       if (request.method === 'POST' && path === '/tables/rename') {
