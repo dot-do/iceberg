@@ -1819,7 +1819,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         );
 
         if (viewResponse.ok) {
-          return icebergError(c, `View already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+          return icebergError(c, `View with same name already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
 
         // Return staged metadata without creating the table
@@ -1851,8 +1851,8 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
         // Check for cross-type conflict (view exists with same name)
-        if (error.error?.includes('View already exists')) {
-          return icebergError(c, `View already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+        if (error.error?.includes('View with same name already exists') || error.error?.includes('View already exists')) {
+          return icebergError(c, `View with same name already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
         if (response.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
           return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
@@ -2241,8 +2241,8 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
               return icebergError(c, `Table already exists: ${namespace.join('.')}.${tableName}`, 'AlreadyExistsException', 409);
             }
             // Check for cross-type conflict (view exists with same name)
-            if (error.error?.includes('View already exists') || error.error?.includes('View with same name')) {
-              return icebergError(c, `View already exists: ${namespace.join('.')}.${tableName}`, 'AlreadyExistsException', 409);
+            if (error.error?.includes('View with same name already exists') || error.error?.includes('View already exists')) {
+              return icebergError(c, `View with same name already exists: ${namespace.join('.')}.${tableName}`, 'AlreadyExistsException', 409);
             }
             if (createResponse.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
               return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
@@ -2363,10 +2363,10 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           );
         }
         // Check for cross-type conflict (view exists at destination)
-        if (error.error?.includes('View already exists')) {
+        if (error.error?.includes('View already exists') || error.error?.includes('View with same name already exists')) {
           return icebergError(
             c,
-            `View already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
+            `View with same name already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
             'AlreadyExistsException',
             409
           );
@@ -2573,9 +2573,9 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
       // Normalize the schema
       const normalizedSchema = normalizeSchema(body.schema);
-      if (normalizedSchema['schema-id'] === undefined) {
-        normalizedSchema['schema-id'] = body.schema['schema-id'] ?? 0;
-      }
+      // Per Iceberg spec, view schemas should have IDs starting from 0, independent of table schemas
+      // Always force schema-id to 0 for the initial view schema, ignoring any incoming value
+      normalizedSchema['schema-id'] = 0;
 
       // Create initial view metadata
       const now = Date.now();
@@ -2775,7 +2775,12 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
               break;
 
             case 'add-schema': {
-              const schemaId = update.schema['schema-id'] ?? newMetadata.schemas.length;
+              // Per Iceberg spec, view schemas should have IDs starting from 0, independent of table schemas
+              // Always assign the next sequential schema ID, ignoring any incoming value
+              const maxExistingSchemaId = newMetadata.schemas.length > 0
+                ? Math.max(...newMetadata.schemas.map(s => s['schema-id'] ?? 0))
+                : -1;
+              const schemaId = maxExistingSchemaId + 1;
               const newSchema = { ...update.schema, 'schema-id': schemaId };
               newMetadata.schemas = [...newMetadata.schemas, newSchema];
               break;
@@ -2976,19 +2981,19 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           );
         }
         // Check for view already exists at destination
-        if (error.error?.includes('View already exists')) {
+        if (error.error?.includes('View already exists') || error.error?.includes('View with same name already exists')) {
           return icebergError(
             c,
-            `View already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
+            `View with same name already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
             'AlreadyExistsException',
             409
           );
         }
         // Check for cross-type conflict (table exists at destination)
-        if (error.error?.includes('Table already exists')) {
+        if (error.error?.includes('Table already exists') || error.error?.includes('Table with same name already exists')) {
           return icebergError(
             c,
-            `Table already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
+            `Table with same name already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
             'AlreadyExistsException',
             409
           );
