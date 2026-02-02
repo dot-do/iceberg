@@ -377,31 +377,102 @@ function normalizeType(type: string | IcebergSchema | IcebergListType | IcebergM
 }
 
 /**
- * Normalize a schema by ensuring all fields have valid IDs.
- * Uses two-pass approach:
- * 1. Find max existing valid ID
- * 2. Assign new IDs starting from max+1 for fields without valid IDs
+ * Normalize a schema by REASSIGNING all field IDs sequentially starting from 1.
+ * Per Iceberg spec, when a table is created, all IDs in the schema are re-assigned
+ * to ensure uniqueness and sequential assignment.
+ *
+ * This means:
+ * - Input schema with IDs 3, 4 → output schema with IDs 1, 2
+ * - Input schema with IDs 100, 200 → output schema with IDs 1, 2
+ * - Input schema with no IDs → output schema with IDs 1, 2
  */
 function normalizeSchema(schema: IcebergSchema): IcebergSchema {
-  // First pass: find max existing valid ID
-  const maxExistingId = findMaxValidFieldId(schema);
-
-  // Second pass: assign IDs starting from max+1 for missing IDs
-  const ctx: FieldIdContext = { nextId: maxExistingId + 1 };
+  // Always start field ID assignment from 1 for new tables
+  const ctx: FieldIdContext = { nextId: 1 };
 
   const result: IcebergSchema = {
     type: 'struct',
-    fields: schema.fields.map(f => normalizeField(f, ctx)),
+    fields: schema.fields.map(f => reassignField(f, ctx)),
   };
 
   if (schema['schema-id'] !== undefined) {
     result['schema-id'] = schema['schema-id'];
   }
   if (schema['identifier-field-ids'] !== undefined) {
+    // TODO: Map old identifier-field-ids to new IDs if needed
     result['identifier-field-ids'] = [...schema['identifier-field-ids']];
   }
 
   return result;
+}
+
+/**
+ * Reassign a field with a fresh ID (always assigns a new ID, ignoring any existing ID).
+ */
+function reassignField(field: IcebergField, ctx: FieldIdContext): IcebergField {
+  const id = ctx.nextId++;
+
+  const copy: IcebergField = {
+    id,
+    name: field.name,
+    required: field.required,
+    type: reassignType(field.type, ctx),
+  };
+  if (field.doc !== undefined) {
+    copy.doc = field.doc;
+  }
+  return copy;
+}
+
+/**
+ * Reassign IDs in a nested type.
+ */
+function reassignType(type: string | IcebergSchema | IcebergListType | IcebergMapType, ctx: FieldIdContext): string | IcebergSchema | IcebergListType | IcebergMapType {
+  if (typeof type === 'string') {
+    return type;
+  }
+
+  if ('fields' in type && type.type === 'struct') {
+    // It's a struct type
+    const result: IcebergSchema = {
+      type: 'struct',
+      fields: type.fields.map(f => reassignField(f, ctx)),
+    };
+    if (type['schema-id'] !== undefined) {
+      result['schema-id'] = type['schema-id'];
+    }
+    if (type['identifier-field-ids'] !== undefined) {
+      result['identifier-field-ids'] = [...type['identifier-field-ids']];
+    }
+    return result;
+  }
+
+  if ('element-id' in type) {
+    // It's a list type
+    const elementId = ctx.nextId++;
+    return {
+      type: 'list',
+      'element-id': elementId,
+      element: reassignType(type.element, ctx),
+      'element-required': type['element-required'],
+    } as IcebergListType;
+  }
+
+  if ('key-id' in type) {
+    // It's a map type
+    const keyId = ctx.nextId++;
+    const valueId = ctx.nextId++;
+    return {
+      type: 'map',
+      'key-id': keyId,
+      key: reassignType(type.key, ctx),
+      'value-id': valueId,
+      value: reassignType(type.value, ctx),
+      'value-required': type['value-required'],
+    } as IcebergMapType;
+  }
+
+  return type;
 }
 
 /**
@@ -1030,6 +1101,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       if (!body.schema) {
         return icebergError(c, 'Schema is required', 'BadRequest', 400);
       }
+
 
       // Generate table UUID
       const tableUuid = crypto.randomUUID();
