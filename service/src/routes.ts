@@ -1841,6 +1841,17 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         });
       }
 
+      // Check if a view with the same name exists (cross-type conflict) before creating table
+      const viewCheckResponse = await catalog.fetch(
+        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/views/${encodeURIComponent(body.name)}`, {
+          method: 'HEAD',
+        })
+      );
+
+      if (viewCheckResponse.ok) {
+        return icebergError(c, `View with same name already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+      }
+
       // Store table in catalog
       const response = await catalog.fetch(
         new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables`, {
@@ -2370,7 +2381,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         if (error.error?.includes('Table already exists')) {
           return icebergError(
             c,
-            `Table already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
+            `Cannot rename ${body.source.namespace.join('.')}.${body.source.name} to ${body.destination.namespace.join('.')}.${body.destination.name}. Table already exists`,
             'AlreadyExistsException',
             409
           );
@@ -2379,7 +2390,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         if (error.error?.includes('View already exists') || error.error?.includes('View with same name already exists')) {
           return icebergError(
             c,
-            `View with same name already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
+            `Cannot rename ${body.source.namespace.join('.')}.${body.source.name} to ${body.destination.namespace.join('.')}.${body.destination.name}. View already exists`,
             'AlreadyExistsException',
             409
           );
@@ -2771,6 +2782,9 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       // Track the ID of the most recently added view version in this update sequence.
       // Per Iceberg spec, view-version-id=-1 means "use the version just added in this same request".
       let lastAddedViewVersionId: number | null = null;
+      // Track the ID of the most recently added schema in this update sequence.
+      // Per Iceberg spec, schema-id=-1 means "use the schema just added in this same request".
+      let lastAddedSchemaId: number | null = null;
       if (body.updates) {
         for (const update of body.updates) {
           switch (update.action) {
@@ -2795,6 +2809,8 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
               const schemaId = maxExistingSchemaId + 1;
               const newSchema = preserveSchemaWithId(update.schema, schemaId);
               newMetadata.schemas = [...newMetadata.schemas, newSchema];
+              // Track the most recently added schema ID for potential -1 reference
+              lastAddedSchemaId = schemaId;
               break;
             }
 
@@ -2812,6 +2828,23 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
                 }
               }
 
+              // Resolve schema-id=-1 to the most recently added schema
+              // Per Iceberg spec, -1 means "use the schema just added in this same request"
+              let resolvedSchemaId = inputVersion['schema-id'];
+              if (resolvedSchemaId === -1) {
+                if (lastAddedSchemaId === null) {
+                  throw new Error('Cannot set schema-id to -1: no schema was added in this update request');
+                }
+                resolvedSchemaId = lastAddedSchemaId;
+              }
+
+              // Calculate the next version-id for the new version
+              // Per Iceberg spec, version-id should be sequential starting from 1
+              const maxExistingVersionId = newMetadata.versions.length > 0
+                ? Math.max(...newMetadata.versions.map(v => v['version-id']))
+                : 0;
+              const nextVersionId = maxExistingVersionId + 1;
+
               // Ensure default-namespace is set (required per Iceberg spec)
               // Fall back to current view's default namespace or an empty array
               const existingDefaultNs = newMetadata.versions.length > 0
@@ -2819,6 +2852,8 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
                 : namespace;
               const newVersion: ViewVersion = {
                 ...inputVersion,
+                'version-id': nextVersionId,
+                'schema-id': resolvedSchemaId,
                 'default-namespace': inputVersion['default-namespace'] ?? existingDefaultNs ?? [],
                 // Ensure summary includes operation field for RCK tests
                 summary: {
@@ -2996,7 +3031,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         if (error.error?.includes('View already exists') || error.error?.includes('View with same name already exists')) {
           return icebergError(
             c,
-            `View with same name already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
+            `Cannot rename ${body.source.namespace.join('.')}.${body.source.name} to ${body.destination.namespace.join('.')}.${body.destination.name}. View already exists`,
             'AlreadyExistsException',
             409
           );
@@ -3005,7 +3040,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         if (error.error?.includes('Table already exists') || error.error?.includes('Table with same name already exists')) {
           return icebergError(
             c,
-            `Table with same name already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
+            `Cannot rename ${body.source.namespace.join('.')}.${body.source.name} to ${body.destination.namespace.join('.')}.${body.destination.name}. Table already exists`,
             'AlreadyExistsException',
             409
           );
