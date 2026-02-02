@@ -663,6 +663,18 @@ function normalizeSchema(schema: IcebergSchema): IcebergSchema {
 }
 
 /**
+ * Preserve a schema's field IDs but set schema-id to a specific value.
+ * Used for views which should keep the field IDs from the request
+ * (since they reference table schemas) but have their own schema-id.
+ */
+function preserveSchemaWithId(schema: IcebergSchema, schemaId: number): IcebergSchema {
+  return {
+    ...schema,
+    'schema-id': schemaId,
+  };
+}
+
+/**
  * Reassign a field with a fresh ID (always assigns a new ID, ignoring any existing ID).
  */
 function reassignField(field: IcebergField, ctx: FieldIdContext): IcebergField {
@@ -2236,13 +2248,14 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
           if (!createResponse.ok) {
             const error = await createResponse.json() as { error: string };
+            // Check for cross-type conflict (view exists with same name) FIRST
+            // This must come before the generic 409 check because view conflicts also return 409
+            if (error.error?.includes('View with same name already exists') || error.error?.includes('View already exists')) {
+              return icebergError(c, `View with same name already exists: ${namespace.join('.')}.${tableName}`, 'AlreadyExistsException', 409);
+            }
             // Check for table already exists
             if (createResponse.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('Table already exists')) {
               return icebergError(c, `Table already exists: ${namespace.join('.')}.${tableName}`, 'AlreadyExistsException', 409);
-            }
-            // Check for cross-type conflict (view exists with same name)
-            if (error.error?.includes('View with same name already exists') || error.error?.includes('View already exists')) {
-              return icebergError(c, `View with same name already exists: ${namespace.join('.')}.${tableName}`, 'AlreadyExistsException', 409);
             }
             if (createResponse.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
               return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
@@ -2571,11 +2584,9 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       const warehousePrefix = c.env.R2_BUCKET ? 's3://iceberg-tables' : 'file:///warehouse';
       const viewLocation = body.location ?? `${warehousePrefix}/${namespace.join('/')}/views/${body.name}`;
 
-      // Normalize the schema
-      const normalizedSchema = normalizeSchema(body.schema);
-      // Per Iceberg spec, view schemas should have IDs starting from 0, independent of table schemas
-      // Always force schema-id to 0 for the initial view schema, ignoring any incoming value
-      normalizedSchema['schema-id'] = 0;
+      // For views, preserve field IDs from the request (since they reference table schemas)
+      // Only set schema-id to 0 for the initial view schema, per Iceberg spec
+      const normalizedSchema = preserveSchemaWithId(body.schema, 0);
 
       // Create initial view metadata
       const now = Date.now();
@@ -2777,11 +2788,12 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
             case 'add-schema': {
               // Per Iceberg spec, view schemas should have IDs starting from 0, independent of table schemas
               // Always assign the next sequential schema ID, ignoring any incoming value
+              // Preserve field IDs from the request (views reference table schemas)
               const maxExistingSchemaId = newMetadata.schemas.length > 0
                 ? Math.max(...newMetadata.schemas.map(s => s['schema-id'] ?? 0))
                 : -1;
               const schemaId = maxExistingSchemaId + 1;
-              const newSchema = { ...update.schema, 'schema-id': schemaId };
+              const newSchema = preserveSchemaWithId(update.schema, schemaId);
               newMetadata.schemas = [...newMetadata.schemas, newSchema];
               break;
             }

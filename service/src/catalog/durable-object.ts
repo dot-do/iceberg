@@ -93,8 +93,8 @@ export class TableAlreadyExistsError extends CatalogError {
   constructor(namespace: string[], name: string, context?: { forView?: boolean; renameFrom?: { namespace: string[]; name: string } }) {
     let message: string;
     if (context?.renameFrom) {
-      // Rename operation - include source identifier
-      message = `Cannot rename ${context.renameFrom.namespace.join('.')}.${context.renameFrom.name} to ${namespace.join('.')}.${name}. Table already exists`;
+      // Rename operation - use cross-type conflict format for clarity
+      message = `Table with same name already exists: ${namespace.join('.')}.${name}`;
     } else if (context?.forView) {
       // Creating view but table exists - report as table conflict
       message = `Table with same name already exists: ${namespace.join('.')}.${name}`;
@@ -124,8 +124,8 @@ export class ViewAlreadyExistsError extends CatalogError {
   constructor(namespace: string[], name: string, context?: { forTable?: boolean; renameFrom?: { namespace: string[]; name: string } }) {
     let message: string;
     if (context?.renameFrom) {
-      // Rename operation - include source identifier
-      message = `Cannot rename ${context.renameFrom.namespace.join('.')}.${context.renameFrom.name} to ${namespace.join('.')}.${name}. View already exists`;
+      // Rename operation - use cross-type conflict format for clarity
+      message = `View with same name already exists: ${namespace.join('.')}.${name}`;
     } else if (context?.forTable) {
       // Creating table but view exists - report as view conflict
       message = `View with same name already exists: ${namespace.join('.')}.${name}`;
