@@ -150,7 +150,7 @@ export function requireNamespacePermission(
         {
           error: {
             message: 'Authentication required',
-            type: 'Unauthorized',
+            type: 'NotAuthorizedException',
             code: 401,
           },
         },
@@ -178,7 +178,7 @@ export function requireNamespacePermission(
           {
             error: {
               message: `Access denied: ${result.reason}`,
-              type: 'Forbidden',
+              type: 'ForbiddenException',
               code: 403,
             },
           },
@@ -198,7 +198,7 @@ export function requireNamespacePermission(
         {
           error: {
             message: `Access denied: ${result.reason}`,
-            type: 'Forbidden',
+            type: 'ForbiddenException',
             code: 403,
           },
         },
@@ -236,7 +236,7 @@ export function requireTablePermission(
         {
           error: {
             message: 'Authentication required',
-            type: 'Unauthorized',
+            type: 'NotAuthorizedException',
             code: 401,
           },
         },
@@ -264,7 +264,7 @@ export function requireTablePermission(
           {
             error: {
               message: `Access denied: ${result.reason}`,
-              type: 'Forbidden',
+              type: 'ForbiddenException',
               code: 403,
             },
           },
@@ -288,7 +288,7 @@ export function requireTablePermission(
           {
             error: {
               message: `Access denied: ${result.reason}`,
-              type: 'Forbidden',
+              type: 'ForbiddenException',
               code: 403,
             },
           },
@@ -308,7 +308,7 @@ export function requireTablePermission(
         {
           error: {
             message: `Access denied: ${result.reason}`,
-            type: 'Forbidden',
+            type: 'ForbiddenException',
             code: 403,
           },
         },
@@ -336,7 +336,7 @@ export function requireGrantPermission(
         {
           error: {
             message: 'Authentication required',
-            type: 'Unauthorized',
+            type: 'NotAuthorizedException',
             code: 401,
           },
         },
@@ -350,7 +350,7 @@ export function requireGrantPermission(
         {
           error: {
             message: 'Namespace parameter is required',
-            type: 'BadRequest',
+            type: 'BadRequestException',
             code: 400,
           },
         },
@@ -369,7 +369,7 @@ export function requireGrantPermission(
           {
             error: {
               message: 'Table parameter is required',
-              type: 'BadRequest',
+              type: 'BadRequestException',
               code: 400,
             },
           },
@@ -386,7 +386,7 @@ export function requireGrantPermission(
         {
           error: {
             message: `Access denied: ${result.reason}`,
-            type: 'Forbidden',
+            type: 'ForbiddenException',
             code: 403,
           },
         },

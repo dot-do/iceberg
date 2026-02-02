@@ -211,19 +211,25 @@ function getCatalogStub(c: Context<{ Bindings: Env; Variables: ContextVariables 
 /**
  * Parse namespace from URL parameter.
  * Namespaces can be multi-level, encoded with URL encoding.
- * Examples: "db" -> ["db"], "db%1Fschema" -> ["db", "schema"]
+ *
+ * Per the Iceberg REST spec, namespace components are separated by the unit
+ * separator character (0x1F) when encoded in a URL path. A dot in the namespace
+ * is NOT a hierarchy separator - it's a literal character in the namespace name.
+ *
+ * Examples:
+ * - "db" -> ["db"] (single component)
+ * - "new.db" -> ["new.db"] (single component with literal dot)
+ * - "db%1Fschema" -> ["db", "schema"] (two components using unit separator)
  */
 function parseNamespace(namespaceParam: string): string[] {
-  // Decode URL encoding and split by unit separator or dot
+  // Decode URL encoding first
   const decoded = decodeURIComponent(namespaceParam);
-  // Check for unit separator (common in Iceberg) or fall back to dot notation
+  // Only split on unit separator (0x1F) for multi-level namespaces
+  // Do NOT split on dots - they are valid characters in namespace names
   if (decoded.includes('\x1f')) {
     return decoded.split('\x1f');
   }
-  // Support dot notation for convenience
-  if (decoded.includes('.')) {
-    return decoded.split('.');
-  }
+  // Single namespace component (may contain dots)
   return [decoded];
 }
 
@@ -598,6 +604,24 @@ function findMaxPartitionFieldId(spec: PartitionSpec): number {
 }
 
 /**
+ * Normalize table metadata to ensure required fields have valid values.
+ * Per Iceberg spec, sort-orders must always be an array with at least the default unsorted order.
+ */
+function normalizeTableMetadata(metadata: TableMetadata): TableMetadata {
+  // Ensure sort-orders is always an array with at least the default unsorted order
+  if (!metadata['sort-orders'] || !Array.isArray(metadata['sort-orders']) || metadata['sort-orders'].length === 0) {
+    metadata['sort-orders'] = [{ 'order-id': 0, fields: [] }];
+  }
+
+  // Ensure partition-specs is always an array with at least the default unpartitioned spec
+  if (!metadata['partition-specs'] || !Array.isArray(metadata['partition-specs']) || metadata['partition-specs'].length === 0) {
+    metadata['partition-specs'] = [{ 'spec-id': 0, fields: [] }];
+  }
+
+  return metadata;
+}
+
+/**
  * Apply table updates to metadata.
  */
 function applyUpdates(
@@ -605,6 +629,10 @@ function applyUpdates(
   updates: TableUpdate[]
 ): TableMetadata {
   let result = { ...metadata };
+
+  // Track the ID of the most recently added schema in this update sequence.
+  // Per Iceberg spec, schema-id=-1 in set-current-schema means "use the schema just added".
+  let lastAddedSchemaId: number | null = null;
 
   for (const update of updates) {
     switch (update.action) {
@@ -627,6 +655,8 @@ function applyUpdates(
           'schema-id': schemaId,
         };
         result.schemas = [...result.schemas, newSchema];
+        // Track this as the most recently added schema for potential -1 reference
+        lastAddedSchemaId = schemaId;
         if (update['last-column-id'] !== undefined) {
           result['last-column-id'] = update['last-column-id'];
         }
@@ -634,7 +664,14 @@ function applyUpdates(
       }
 
       case 'set-current-schema': {
-        const schemaId = update['schema-id'];
+        let schemaId = update['schema-id'];
+        // Per Iceberg spec, -1 means "use the schema just added in this same request"
+        if (schemaId === -1) {
+          if (lastAddedSchemaId === null) {
+            throw new Error('Cannot set current schema to -1: no schema was added in this update request');
+          }
+          schemaId = lastAddedSchemaId;
+        }
         // Validate schema-id is non-negative and exists in schemas
         if (typeof schemaId !== 'number' || schemaId < 0) {
           throw new Error(`Invalid schema-id: ${schemaId}. Must be a non-negative integer.`);
@@ -648,7 +685,7 @@ function applyUpdates(
       }
 
       case 'add-spec':
-        result['partition-specs'] = [...result['partition-specs'], update.spec];
+        result['partition-specs'] = [...(result['partition-specs'] ?? []), update.spec];
         break;
 
       case 'set-default-spec':
@@ -656,7 +693,7 @@ function applyUpdates(
         break;
 
       case 'add-sort-order':
-        result['sort-orders'] = [...result['sort-orders'], update['sort-order']];
+        result['sort-orders'] = [...(result['sort-orders'] ?? []), update['sort-order']];
         break;
 
       case 'set-default-sort-order':
@@ -719,7 +756,7 @@ function applyUpdates(
   }
 
   result['last-updated-ms'] = Date.now();
-  return result;
+  return normalizeTableMetadata(result);
 }
 
 /**
@@ -877,7 +914,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to list namespaces',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }
@@ -891,7 +928,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       const body = await c.req.json() as CreateNamespaceRequest;
 
       if (!body.namespace || !Array.isArray(body.namespace) || body.namespace.length === 0) {
-        return icebergError(c, 'Namespace is required and must be a non-empty array', 'BadRequest', 400);
+        return icebergError(c, 'Namespace is required and must be a non-empty array', 'BadRequestException', 400);
       }
 
       const catalog = getCatalogStub(c);
@@ -909,7 +946,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       if (!response.ok) {
         const error = await response.json() as { error: string };
         if (response.status === 409 || error.error?.includes('UNIQUE constraint')) {
-          return icebergError(c, `Namespace already exists: ${body.namespace.join('.')}`, 'AlreadyExists', 409);
+          return icebergError(c, `Namespace already exists: ${body.namespace.join('.')}`, 'AlreadyExistsException', 409);
         }
         throw new Error(error.error || 'Failed to create namespace');
       }
@@ -923,7 +960,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to create namespace',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }
@@ -947,7 +984,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         if (c.req.method === 'HEAD') {
           return c.body(null, 404);
         }
-        return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespace', 404);
+        return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
       }
 
       // HEAD returns 204 No Content, GET returns full response
@@ -968,7 +1005,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to get namespace',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }
@@ -992,9 +1029,9 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       if (!response.ok) {
         const error = await response.json() as { error: string };
         if (error.error?.includes('not empty')) {
-          return icebergError(c, `Namespace is not empty: ${namespace.join('.')}`, 'NamespaceNotEmpty', 409);
+          return icebergError(c, `Namespace is not empty: ${namespace.join('.')}`, 'NamespaceNotEmptyException', 409);
         }
-        return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespace', 404);
+        return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
       }
 
       return c.body(null, 204);
@@ -1002,7 +1039,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to drop namespace',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }
@@ -1030,7 +1067,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       );
 
       if (!response.ok) {
-        return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespace', 404);
+        return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
       }
 
       const data = await response.json() as { updated: string[]; removed: string[]; missing: string[] };
@@ -1044,7 +1081,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to update namespace properties',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }
@@ -1064,7 +1101,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       );
 
       if (!response.ok) {
-        return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespace', 404);
+        return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
       }
 
       const data = await response.json() as { tables: Array<{ namespace: string[]; name: string }> };
@@ -1079,7 +1116,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to list tables',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }
@@ -1095,11 +1132,11 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       const body = await c.req.json() as CreateTableRequest;
 
       if (!body.name) {
-        return icebergError(c, 'Table name is required', 'BadRequest', 400);
+        return icebergError(c, 'Table name is required', 'BadRequestException', 400);
       }
 
       if (!body.schema) {
-        return icebergError(c, 'Schema is required', 'BadRequest', 400);
+        return icebergError(c, 'Schema is required', 'BadRequestException', 400);
       }
 
 
@@ -1123,6 +1160,9 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       // Determine metadata location
       const metadataLocation = `${tableLocation}/metadata/00000-${tableUuid}.metadata.json`;
 
+      // Normalize metadata to ensure required fields have valid values
+      const normalizedMetadata = normalizeTableMetadata(metadata);
+
       // Store table in catalog
       const catalog = getCatalogStub(c);
       const response = await catalog.fetch(
@@ -1133,7 +1173,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
             name: body.name,
             location: tableLocation,
             metadataLocation,
-            metadata,
+            metadata: normalizedMetadata,
             properties: body.properties ?? {},
           }),
         })
@@ -1142,10 +1182,10 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       if (!response.ok) {
         const error = await response.json() as { error: string };
         if (response.status === 409 || error.error?.includes('UNIQUE constraint')) {
-          return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExists', 409);
+          return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
         if (response.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
-          return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespace', 404);
+          return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
         }
         throw new Error(error.error || 'Failed to create table');
       }
@@ -1154,28 +1194,28 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       if (body['stage-create']) {
         return c.json({
           'metadata-location': metadataLocation,
-          metadata,
+          metadata: normalizedMetadata,
         });
       }
 
       // Write metadata to R2 if available
       if (c.env.R2_BUCKET) {
         const metadataPath = metadataLocation.replace('s3://iceberg-tables/', '');
-        await c.env.R2_BUCKET.put(metadataPath, JSON.stringify(metadata, null, 2), {
+        await c.env.R2_BUCKET.put(metadataPath, JSON.stringify(normalizedMetadata, null, 2), {
           httpMetadata: { contentType: 'application/json' },
         });
       }
 
       return c.json({
         'metadata-location': metadataLocation,
-        metadata,
+        metadata: normalizedMetadata,
       });
     } catch (error) {
       if (error instanceof Response) throw error;
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to create table',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }
@@ -1203,7 +1243,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         return icebergError(
           c,
           `Table does not exist: ${namespace.join('.')}.${tableName}`,
-          'NoSuchTable',
+          'NoSuchTableException',
           404
         );
       }
@@ -1219,11 +1259,11 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         metadata?: TableMetadata;
       };
 
-      // If we have metadata stored, return it
+      // If we have metadata stored, return it (with normalization)
       if (data.metadata) {
         return c.json({
           'metadata-location': data.metadataLocation,
-          metadata: data.metadata,
+          metadata: normalizeTableMetadata(data.metadata),
         });
       }
 
@@ -1236,7 +1276,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           const metadata = await object.json() as TableMetadata;
           return c.json({
             'metadata-location': data.metadataLocation,
-            metadata,
+            metadata: normalizeTableMetadata(metadata),
           });
         }
       }
@@ -1253,10 +1293,10 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           'current-schema-id': 0,
           schemas: [],
           'default-spec-id': 0,
-          'partition-specs': [],
+          'partition-specs': [{ 'spec-id': 0, fields: [] }],
           'last-partition-id': 999,
           'default-sort-order-id': 0,
-          'sort-orders': [],
+          'sort-orders': [{ 'order-id': 0, fields: [] }],
         },
       });
     } catch (error) {
@@ -1266,7 +1306,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to load table',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }
@@ -1308,7 +1348,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         return icebergError(
           c,
           `Table does not exist: ${namespace.join('.')}.${tableName}`,
-          'NoSuchTable',
+          'NoSuchTableException',
           404
         );
       }
@@ -1328,7 +1368,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to drop table',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }
@@ -1355,7 +1395,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         return icebergError(
           c,
           `Table does not exist: ${namespace.join('.')}.${tableName}`,
-          'NoSuchTable',
+          'NoSuchTableException',
           404
         );
       }
@@ -1380,7 +1420,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       // Validate requirements
       const validation = validateRequirements(currentMetadata ?? null, body.requirements ?? []);
       if (!validation.valid) {
-        return icebergError(c, validation.message!, 'CommitFailed', 409);
+        return icebergError(c, validation.message!, 'CommitFailedException', 409);
       }
 
       // Apply updates
@@ -1418,7 +1458,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to commit table changes',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }
@@ -1432,7 +1472,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       const body = await c.req.json() as RenameTableRequest;
 
       if (!body.source || !body.destination) {
-        return icebergError(c, 'Source and destination are required', 'BadRequest', 400);
+        return icebergError(c, 'Source and destination are required', 'BadRequestException', 400);
       }
 
       const catalog = getCatalogStub(c);
@@ -1455,7 +1495,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           return icebergError(
             c,
             `Table does not exist: ${body.source.namespace.join('.')}.${body.source.name}`,
-            'NoSuchTable',
+            'NoSuchTableException',
             404
           );
         }
@@ -1463,7 +1503,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           return icebergError(
             c,
             `Table already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
-            'AlreadyExists',
+            'AlreadyExistsException',
             409
           );
         }
@@ -1475,7 +1515,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to rename table',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }
@@ -1491,11 +1531,11 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       const body = await c.req.json() as RegisterTableRequest;
 
       if (!body.name) {
-        return icebergError(c, 'Table name is required', 'BadRequest', 400);
+        return icebergError(c, 'Table name is required', 'BadRequestException', 400);
       }
 
       if (!body['metadata-location']) {
-        return icebergError(c, 'Metadata location is required', 'BadRequest', 400);
+        return icebergError(c, 'Metadata location is required', 'BadRequestException', 400);
       }
 
       const metadataLocation = body['metadata-location'];
@@ -1515,13 +1555,16 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         return icebergError(
           c,
           `Unable to load metadata from location: ${metadataLocation}`,
-          'BadRequest',
+          'BadRequestException',
           400
         );
       }
 
       // Extract table location from metadata
       const tableLocation = metadata.location;
+
+      // Normalize metadata to ensure required fields have valid values
+      const normalizedMetadata = normalizeTableMetadata(metadata);
 
       // Store table in catalog
       const catalog = getCatalogStub(c);
@@ -1533,8 +1576,8 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
             name: body.name,
             location: tableLocation,
             metadataLocation,
-            metadata,
-            properties: metadata.properties ?? {},
+            metadata: normalizedMetadata,
+            properties: normalizedMetadata.properties ?? {},
           }),
         })
       );
@@ -1542,25 +1585,25 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       if (!response.ok) {
         const error = await response.json() as { error: string };
         if (response.status === 409 || error.error?.includes('UNIQUE constraint')) {
-          return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExists', 409);
+          return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
         if (response.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
-          return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespace', 404);
+          return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
         }
         throw new Error(error.error || 'Failed to register table');
       }
 
-      // Return LoadTableResponse format
+      // Return LoadTableResponse format with normalized metadata
       return c.json({
         'metadata-location': metadataLocation,
-        metadata,
+        metadata: normalizedMetadata,
       });
     } catch (error) {
       if (error instanceof Response) throw error;
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to register table',
-        'InternalServerError',
+        'ServiceFailureException',
         500
       );
     }

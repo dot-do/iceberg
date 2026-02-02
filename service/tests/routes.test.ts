@@ -384,7 +384,7 @@ describe('Iceberg REST Catalog Routes', () => {
         const res = await request('POST', '/v1/namespaces', { namespace: ['my_db'] });
         expect(res.status).toBe(409);
         const data = await res.json();
-        expect(data.error.type).toBe('AlreadyExists');
+        expect(data.error.type).toBe('AlreadyExistsException');
       });
 
       it('should return 400 for missing namespace', async () => {
@@ -411,7 +411,7 @@ describe('Iceberg REST Catalog Routes', () => {
         const res = await request('GET', '/v1/namespaces/nonexistent');
         expect(res.status).toBe(404);
         const data = await res.json();
-        expect(data.error.type).toBe('NoSuchNamespace');
+        expect(data.error.type).toBe('NoSuchNamespaceException');
       });
     });
 
@@ -438,7 +438,7 @@ describe('Iceberg REST Catalog Routes', () => {
         const res = await request('DELETE', '/v1/namespaces/non_empty');
         expect(res.status).toBe(409);
         const data = await res.json();
-        expect(data.error.type).toBe('NamespaceNotEmpty');
+        expect(data.error.type).toBe('NamespaceNotEmptyException');
       });
     });
   });
@@ -530,7 +530,7 @@ describe('Iceberg REST Catalog Routes', () => {
         const res = await request('GET', '/v1/namespaces/test_db/tables/nonexistent');
         expect(res.status).toBe(404);
         const data = await res.json();
-        expect(data.error.type).toBe('NoSuchTable');
+        expect(data.error.type).toBe('NoSuchTableException');
       });
     });
 
@@ -841,7 +841,7 @@ describe('Iceberg REST Catalog Routes', () => {
       });
       expect(res.status).toBe(409);
       const data = await res.json();
-      expect(data.error.type).toBe('AlreadyExists');
+      expect(data.error.type).toBe('AlreadyExistsException');
     });
 
     it('should return 404 for non-existent namespace', async () => {
@@ -868,7 +868,7 @@ describe('Iceberg REST Catalog Routes', () => {
       });
       expect(res.status).toBe(404);
       const data = await res.json();
-      expect(data.error.type).toBe('NoSuchNamespace');
+      expect(data.error.type).toBe('NoSuchNamespaceException');
     });
   });
 });
