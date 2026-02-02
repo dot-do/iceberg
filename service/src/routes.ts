@@ -1488,6 +1488,33 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       overrides: {
         // Properties that cannot be overridden by clients
       },
+      // Advertise supported endpoints so clients know what operations are available
+      // This is required by the Iceberg REST client to enable features like views
+      endpoints: [
+        'GET /v1/{prefix}/namespaces',
+        'POST /v1/{prefix}/namespaces',
+        'GET /v1/{prefix}/namespaces/{namespace}',
+        'HEAD /v1/{prefix}/namespaces/{namespace}',
+        'DELETE /v1/{prefix}/namespaces/{namespace}',
+        'POST /v1/{prefix}/namespaces/{namespace}/properties',
+        'GET /v1/{prefix}/namespaces/{namespace}/tables',
+        'POST /v1/{prefix}/namespaces/{namespace}/tables',
+        'GET /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+        'HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+        'POST /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+        'DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}',
+        'POST /v1/{prefix}/tables/rename',
+        'POST /v1/{prefix}/namespaces/{namespace}/register',
+        'POST /v1/{prefix}/transactions/commit',
+        // View endpoints
+        'GET /v1/{prefix}/namespaces/{namespace}/views',
+        'POST /v1/{prefix}/namespaces/{namespace}/views',
+        'GET /v1/{prefix}/namespaces/{namespace}/views/{view}',
+        'HEAD /v1/{prefix}/namespaces/{namespace}/views/{view}',
+        'POST /v1/{prefix}/namespaces/{namespace}/views/{view}',
+        'DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}',
+        'POST /v1/{prefix}/views/rename',
+      ],
     };
 
     // Return prefix for warehouse isolation - the client will prepend this to all paths
