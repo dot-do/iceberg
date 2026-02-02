@@ -800,15 +800,27 @@ function findMaxPartitionFieldId(spec: PartitionSpec): number {
 /**
  * Normalize table metadata to ensure required fields have valid values.
  * Per Iceberg spec, sort-orders must always be an array with at least the default unsorted order.
+ * Per Iceberg spec, partition-specs must always be an array with at least the default unpartitioned spec.
+ *
+ * IMPORTANT: This function must not add duplicates. If a spec/order with ID 0 already exists,
+ * don't add another one.
  */
 function normalizeTableMetadata(metadata: TableMetadata): TableMetadata {
-  // Ensure sort-orders is always an array with at least the default unsorted order
-  if (!metadata['sort-orders'] || !Array.isArray(metadata['sort-orders']) || metadata['sort-orders'].length === 0) {
+  // Ensure sort-orders is always an array
+  if (!metadata['sort-orders'] || !Array.isArray(metadata['sort-orders'])) {
+    metadata['sort-orders'] = [];
+  }
+  // If there's no sort order at all, add the default unsorted order
+  if (metadata['sort-orders'].length === 0) {
     metadata['sort-orders'] = [{ 'order-id': 0, fields: [] }];
   }
 
-  // Ensure partition-specs is always an array with at least the default unpartitioned spec
-  if (!metadata['partition-specs'] || !Array.isArray(metadata['partition-specs']) || metadata['partition-specs'].length === 0) {
+  // Ensure partition-specs is always an array
+  if (!metadata['partition-specs'] || !Array.isArray(metadata['partition-specs'])) {
+    metadata['partition-specs'] = [];
+  }
+  // If there's no partition spec at all, add the default unpartitioned spec
+  if (metadata['partition-specs'].length === 0) {
     metadata['partition-specs'] = [{ 'spec-id': 0, fields: [] }];
   }
 
@@ -1726,15 +1738,12 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         // First, find the assign-uuid and set-location updates to get the basics
         let tableUuid = crypto.randomUUID();
         let tableLocation = '';
-        let initialSchema: IcebergSchema | null = null;
 
         for (const update of body.updates ?? []) {
           if (update.action === 'assign-uuid') {
             tableUuid = update.uuid;
           } else if (update.action === 'set-location') {
             tableLocation = update.location;
-          } else if (update.action === 'add-schema') {
-            initialSchema = update.schema;
           }
         }
 
@@ -1744,19 +1753,28 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           tableLocation = `${warehousePrefix}/${namespace.join('/')}/${tableName}`;
         }
 
-        if (!initialSchema) {
-          return icebergError(c, 'Cannot create table: no schema provided in updates', 'BadRequestException', 400);
-        }
-
-        // Create base metadata
-        const baseMetadata = createDefaultMetadata(
-          tableUuid,
-          tableLocation,
-          initialSchema,
-          undefined,
-          undefined,
-          {}
-        );
+        // Create minimal skeleton metadata (no schemas yet - they'll come from updates)
+        const now = Date.now();
+        const baseMetadata: TableMetadata = {
+          'format-version': 2,
+          'table-uuid': tableUuid,
+          location: tableLocation,
+          'last-sequence-number': 0,
+          'last-updated-ms': now,
+          'last-column-id': 0,
+          'current-schema-id': 0,
+          schemas: [],  // Will be populated by add-schema updates
+          'default-spec-id': 0,
+          'partition-specs': [],  // Will be populated by add-spec updates
+          'last-partition-id': 999,
+          'default-sort-order-id': 0,
+          'sort-orders': [],  // Will be populated by add-sort-order updates
+          properties: {},
+          snapshots: [],
+          'snapshot-log': [],
+          'metadata-log': [],
+          refs: {},
+        };
 
         // Apply all updates to the base metadata
         newMetadata = applyUpdates(baseMetadata, body.updates ?? []);
@@ -1768,6 +1786,17 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       // Generate new metadata location
       const seqNum = (newMetadata['last-sequence-number'] ?? 0).toString().padStart(5, '0');
       const newMetadataLocation = `${newMetadata.location}/metadata/${seqNum}-${newMetadata['table-uuid']}.metadata.json`;
+
+      // If this is an update (not a create), add the previous metadata location to metadata-log
+      if (tableData?.metadataLocation && currentMetadata !== null) {
+        newMetadata['metadata-log'] = [
+          ...(newMetadata['metadata-log'] ?? []),
+          {
+            'timestamp-ms': currentMetadata['last-updated-ms'],
+            'metadata-file': tableData.metadataLocation,
+          },
+        ];
+      }
 
       // Write new metadata to R2
       if (c.env.R2_BUCKET) {
