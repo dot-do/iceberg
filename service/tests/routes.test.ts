@@ -277,14 +277,14 @@ async function mockDOFetch(request: Request): Promise<Response> {
       if (!mockNamespaces.has(namespaceKey)) {
         return Response.json({ error: 'Namespace does not exist' }, { status: 404 });
       }
-      const views: Array<{ namespace: string[]; name: string }> = [];
+      const identifiers: Array<{ namespace: string[]; name: string }> = [];
       for (const viewKey of mockViews.keys()) {
         const [ns, name] = viewKey.split('\x1f\x00');
         if (ns === namespaceKey) {
-          views.push({ namespace: ns.split('\x1f'), name });
+          identifiers.push({ namespace: ns.split('\x1f'), name });
         }
       }
-      return Response.json({ views });
+      return Response.json({ identifiers });
     }
 
     // POST /namespaces/{namespace}/views
@@ -629,9 +629,12 @@ describe('Iceberg REST Catalog Routes', () => {
         expect(data.identifiers).toEqual([]);
       });
 
-      it('should return 404 for non-existent namespace', async () => {
+      it('should return 404 for non-existent namespace (testListNonExistingNamespace)', async () => {
         const res = await request('GET', '/v1/namespaces/nonexistent/tables');
         expect(res.status).toBe(404);
+        const data = await res.json();
+        expect(data.error.type).toBe('NoSuchNamespaceException');
+        expect(data.error.message).toContain('Namespace does not exist');
       });
     });
 
@@ -1095,6 +1098,146 @@ describe('Iceberg REST Catalog Routes', () => {
         const errorData = await conflictRes.json() as { error: { message: string; type: string } };
         // Should contain specific message about field id, not generic conflict message
         expect(errorData.error.message).toContain('last assigned field id changed');
+      });
+
+      it('should return "current schema changed" when assert-current-schema-id fails (testUpdateTableSchemaConflict)', async () => {
+        // This test verifies the RCK testUpdateTableSchemaConflict requirement:
+        // When assert-current-schema-id requirement fails, the error should say "current schema changed"
+
+        // Create table with initial schema
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'schema_id_conflict_test',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+        const originalSchemaId = createData.metadata['current-schema-id'];
+
+        // First client adds a new schema, changing the current-schema-id
+        const firstUpdateRes = await request('POST', '/v1/namespaces/test_db/tables/schema_id_conflict_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            {
+              action: 'add-schema',
+              schema: {
+                type: 'struct',
+                'schema-id': -1,
+                fields: [
+                  { id: 1, name: 'id', required: true, type: 'long' },
+                  { id: 2, name: 'name', required: false, type: 'string' },
+                ],
+              },
+            },
+            { action: 'set-current-schema', 'schema-id': -1 },
+          ],
+        });
+        expect(firstUpdateRes.status).toBe(200);
+
+        // Second client tries to update with stale assert-current-schema-id
+        const conflictRes = await request('POST', '/v1/namespaces/test_db/tables/schema_id_conflict_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+            // This is stale - schema id changed from 0 to 1
+            { type: 'assert-current-schema-id', 'current-schema-id': originalSchemaId },
+          ],
+          updates: [
+            {
+              action: 'add-schema',
+              schema: {
+                type: 'struct',
+                'schema-id': -1,
+                fields: [
+                  { id: 1, name: 'id', required: true, type: 'long' },
+                  { id: 3, name: 'description', required: false, type: 'string' },
+                ],
+              },
+            },
+            { action: 'set-current-schema', 'schema-id': -1 },
+          ],
+        });
+
+        expect(conflictRes.status).toBe(409);
+        const errorData = await conflictRes.json() as { error: { message: string; type: string } };
+        // Should contain specific message about current schema changed
+        expect(errorData.error.message).toContain('current schema changed');
+      });
+
+      it('should prioritize "current schema changed" over "last assigned field id changed" when both fail', async () => {
+        // When both assert-current-schema-id and assert-last-assigned-field-id fail,
+        // the error message should prioritize "current schema changed" as it's more semantically accurate
+
+        // Create table with initial schema
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'schema_priority_test',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+        const originalSchemaId = createData.metadata['current-schema-id'];
+        const originalFieldId = createData.metadata['last-column-id'];
+
+        // First client adds a new schema, changing both current-schema-id and last-column-id
+        const firstUpdateRes = await request('POST', '/v1/namespaces/test_db/tables/schema_priority_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            {
+              action: 'add-schema',
+              schema: {
+                type: 'struct',
+                'schema-id': -1,
+                fields: [
+                  { id: 1, name: 'id', required: true, type: 'long' },
+                  { id: 2, name: 'name', required: false, type: 'string' },
+                ],
+              },
+            },
+            { action: 'set-current-schema', 'schema-id': -1 },
+          ],
+        });
+        expect(firstUpdateRes.status).toBe(200);
+
+        // Second client sends BOTH stale requirements (field id first, then schema id)
+        // The error should still be about schema id due to priority sorting
+        const conflictRes = await request('POST', '/v1/namespaces/test_db/tables/schema_priority_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+            // Intentionally put field id FIRST to test priority sorting
+            { type: 'assert-last-assigned-field-id', 'last-assigned-field-id': originalFieldId },
+            { type: 'assert-current-schema-id', 'current-schema-id': originalSchemaId },
+          ],
+          updates: [
+            {
+              action: 'add-schema',
+              schema: {
+                type: 'struct',
+                'schema-id': -1,
+                fields: [
+                  { id: 1, name: 'id', required: true, type: 'long' },
+                  { id: 3, name: 'description', required: false, type: 'string' },
+                ],
+              },
+            },
+            { action: 'set-current-schema', 'schema-id': -1 },
+          ],
+        });
+
+        expect(conflictRes.status).toBe(409);
+        const errorData = await conflictRes.json() as { error: { message: string; type: string } };
+        // Even though assert-last-assigned-field-id was sent first,
+        // the error should be about current schema due to priority
+        expect(errorData.error.message).toContain('current schema changed');
       });
 
       it('should allow partition spec update then revert (testUpdateTableSpecThenRevert)', async () => {
@@ -2095,6 +2238,23 @@ describe('Iceberg REST Catalog Routes', () => {
       await request('POST', '/v1/namespaces', { namespace: ['view_db'] });
     });
 
+    describe('GET /v1/namespaces/{namespace}/views - List views', () => {
+      it('should return empty list when no views exist', async () => {
+        const res = await request('GET', '/v1/namespaces/view_db/views');
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.identifiers).toEqual([]);
+      });
+
+      it('should return 404 for non-existent namespace (testListNonExistingNamespace)', async () => {
+        const res = await request('GET', '/v1/namespaces/nonexistent/views');
+        expect(res.status).toBe(404);
+        const data = await res.json();
+        expect(data.error.type).toBe('NoSuchNamespaceException');
+        expect(data.error.message).toContain('Namespace does not exist');
+      });
+    });
+
     describe('POST /v1/namespaces/{namespace}/views - Create view', () => {
       const validViewRequest = {
         name: 'test_view',
@@ -2180,6 +2340,7 @@ describe('Iceberg REST Catalog Routes', () => {
         expect(res.status).toBe(400);
         const data = await res.json();
         expect(data.error.message).toContain('Cannot add multiple queries for dialect spark');
+        expect(data.error.type).toBe('IllegalArgumentException');
       });
 
       it('should return 404 for non-existent namespace', async () => {

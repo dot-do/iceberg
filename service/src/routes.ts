@@ -1391,7 +1391,7 @@ function getConflictingRequirements(
   );
 
   // Find failed requirements that conflict with what we're modifying
-  return failedRequirements.filter(f => {
+  const conflicts = failedRequirements.filter(f => {
     switch (f.type) {
       case 'assert-current-schema-id':
       case 'assert-last-assigned-field-id':
@@ -1408,6 +1408,25 @@ function getConflictingRequirements(
       default:
         return false;
     }
+  });
+
+  // Sort conflicts to prioritize specific requirement types for better error messages.
+  // For schema conflicts, 'assert-current-schema-id' should come before 'assert-last-assigned-field-id'
+  // because "current schema changed" is more semantically accurate than "last assigned field id changed".
+  const priorityOrder: Record<string, number> = {
+    'assert-table-uuid': 0,
+    'assert-create': 1,
+    'assert-current-schema-id': 2,
+    'assert-last-assigned-field-id': 3,
+    'assert-default-spec-id': 4,
+    'assert-last-assigned-partition-id': 5,
+    'assert-default-sort-order-id': 6,
+  };
+
+  return conflicts.sort((a, b) => {
+    const priorityA = priorityOrder[a.type] ?? 100;
+    const priorityB = priorityOrder[b.type] ?? 100;
+    return priorityA - priorityB;
   });
 }
 
@@ -2731,7 +2750,7 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
             return icebergError(
               c,
               `Cannot add multiple queries for dialect ${rep.dialect}`,
-              'BadRequestException',
+              'IllegalArgumentException',
               400
             );
           }
