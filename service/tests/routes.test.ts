@@ -1176,13 +1176,13 @@ describe('Iceberg REST Catalog Routes', () => {
         expect(errorData.error.message).toContain('current schema changed');
       });
 
-      it('should prioritize "current schema changed" over "last assigned field id changed" when both fail', async () => {
-        // When both assert-current-schema-id and assert-last-assigned-field-id fail,
-        // the error message should prioritize "current schema changed" as it's more semantically accurate
+      it('should return first failing requirement in request order when multiple fail', async () => {
+        // When multiple requirements fail, return the first one in the order they were checked
+        // (not sorted by any priority - this matches Iceberg client expectations)
 
         // Create table with initial schema
         const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
-          name: 'schema_priority_test',
+          name: 'schema_order_test',
           schema: {
             type: 'struct',
             'schema-id': 0,
@@ -1195,7 +1195,7 @@ describe('Iceberg REST Catalog Routes', () => {
         const originalFieldId = createData.metadata['last-column-id'];
 
         // First client adds a new schema, changing both current-schema-id and last-column-id
-        const firstUpdateRes = await request('POST', '/v1/namespaces/test_db/tables/schema_priority_test', {
+        const firstUpdateRes = await request('POST', '/v1/namespaces/test_db/tables/schema_order_test', {
           requirements: [
             { type: 'assert-table-uuid', uuid: tableUuid },
           ],
@@ -1216,13 +1216,14 @@ describe('Iceberg REST Catalog Routes', () => {
         });
         expect(firstUpdateRes.status).toBe(200);
 
-        // Second client sends BOTH stale requirements (field id first, then schema id)
-        // The error should still be about schema id due to priority sorting
-        const conflictRes = await request('POST', '/v1/namespaces/test_db/tables/schema_priority_test', {
+        // Second client sends field-id requirement FIRST
+        // The error should be about field id since it's checked first
+        const conflictRes = await request('POST', '/v1/namespaces/test_db/tables/schema_order_test', {
           requirements: [
             { type: 'assert-table-uuid', uuid: tableUuid },
-            // Intentionally put field id FIRST to test priority sorting
+            // Field id first
             { type: 'assert-last-assigned-field-id', 'last-assigned-field-id': originalFieldId },
+            // Schema id second
             { type: 'assert-current-schema-id', 'current-schema-id': originalSchemaId },
           ],
           updates: [
@@ -1243,9 +1244,8 @@ describe('Iceberg REST Catalog Routes', () => {
 
         expect(conflictRes.status).toBe(409);
         const errorData = await conflictRes.json() as { error: { message: string; type: string } };
-        // Even though assert-last-assigned-field-id was sent first,
-        // the error should be about current schema due to priority
-        expect(errorData.error.message).toContain('current schema changed');
+        // Should return the first failing requirement in request order
+        expect(errorData.error.message).toContain('last assigned field id changed');
       });
 
       it('should allow partition spec update then revert (testUpdateTableSpecThenRevert)', async () => {
