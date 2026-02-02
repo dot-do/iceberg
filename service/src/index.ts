@@ -79,8 +79,13 @@ const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 app.use('/*', cors());
 
 // Catalog backend middleware - sets up the appropriate backend
+// Uses warehouse parameter for catalog isolation (different warehouses = different catalogs)
 app.use('/*', async (c, next) => {
   const backendType = c.env.CATALOG_BACKEND ?? 'durable-object';
+
+  // Extract warehouse from query parameter or header for catalog isolation
+  // Per Iceberg REST spec, warehouse is passed as query param to /v1/config
+  const warehouse = c.req.query('warehouse') || c.req.header('X-Iceberg-Warehouse') || 'default';
 
   if (backendType === 'd1') {
     // Use D1 backend
@@ -99,7 +104,8 @@ app.use('/*', async (c, next) => {
         500
       );
     }
-    const id = c.env.CATALOG.idFromName('default');
+    // Use warehouse name to isolate catalogs - each warehouse gets its own Durable Object
+    const id = c.env.CATALOG.idFromName(warehouse);
     c.set('catalogStub', c.env.CATALOG.get(id));
   }
 
