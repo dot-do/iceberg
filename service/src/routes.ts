@@ -2482,8 +2482,20 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       // Normalize metadata to ensure required fields have valid values
       const normalizedMetadata = normalizeTableMetadata(metadata);
 
-      // Store table in catalog
       const catalog = getCatalogStub(c);
+
+      // Check if a view with the same name exists (cross-type conflict) before registering
+      const viewCheckResponse = await catalog.fetch(
+        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/views/${encodeURIComponent(body.name)}`, {
+          method: 'HEAD',
+        })
+      );
+
+      if (viewCheckResponse.ok) {
+        return icebergError(c, `View with same name already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+      }
+
+      // Store table in catalog
       const response = await catalog.fetch(
         new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables`, {
           method: 'POST',
@@ -2500,7 +2512,11 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
       if (!response.ok) {
         const error = await response.json() as { error: string };
-        if (response.status === 409 || error.error?.includes('UNIQUE constraint')) {
+        // Check for cross-type conflict (view exists with same name)
+        if (error.error?.includes('View with same name already exists') || error.error?.includes('View already exists')) {
+          return icebergError(c, `View with same name already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+        }
+        if (response.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('Table already exists')) {
           return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
         if (response.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
