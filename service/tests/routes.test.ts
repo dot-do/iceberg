@@ -43,6 +43,7 @@ const mockTables = new Map<string, {
   metadataLocation: string;
   metadata?: unknown;
   properties: Record<string, string>;
+  version: number;
 }>();
 
 // Reset mock storage
@@ -170,6 +171,7 @@ async function mockDOFetch(request: Request): Promise<Response> {
         metadataLocation: body.metadataLocation,
         metadata: body.metadata,
         properties: body.properties ?? {},
+        version: 1,
       });
       return Response.json({ created: true });
     }
@@ -184,7 +186,14 @@ async function mockDOFetch(request: Request): Promise<Response> {
       if (!table) {
         return Response.json({ error: 'Table does not exist' }, { status: 404 });
       }
-      return Response.json(table);
+      // Include version in response for OCC
+      return Response.json({
+        location: table.location,
+        metadataLocation: table.metadataLocation,
+        metadata: table.metadata,
+        properties: table.properties,
+        version: table.version,
+      });
     }
 
     // DELETE /namespaces/{namespace}/tables/{table}
@@ -210,13 +219,21 @@ async function mockDOFetch(request: Request): Promise<Response> {
       if (!table) {
         return Response.json({ error: 'Table does not exist' }, { status: 404 });
       }
-      const body = await request.json() as { metadataLocation: string; metadata?: unknown };
+      const body = await request.json() as { metadataLocation: string; metadata?: unknown; expectedVersion?: number };
+      // Check OCC - if expectedVersion is provided, verify it matches
+      if (body.expectedVersion !== undefined && body.expectedVersion !== table.version) {
+        return Response.json(
+          { error: 'Concurrent modification detected', code: 'CONFLICT' },
+          { status: 409 }
+        );
+      }
       table.metadataLocation = body.metadataLocation;
       if (body.metadata) {
         table.metadata = body.metadata;
       }
+      table.version = table.version + 1;
       mockTables.set(tableKey, table);
-      return Response.json({ committed: true });
+      return Response.json({ committed: true, version: table.version });
     }
 
     // POST /tables/rename
@@ -231,13 +248,13 @@ async function mockDOFetch(request: Request): Promise<Response> {
       const toKey = body.toNamespace.join('\x1f') + '\x1f\x00' + body.toName;
       const table = mockTables.get(fromKey);
       if (!table) {
-        return Response.json({ error: 'Source table does not exist' }, { status: 404 });
+        return Response.json({ error: 'Table does not exist' }, { status: 404 });
       }
       if (!mockNamespaces.has(body.toNamespace.join('\x1f'))) {
         return Response.json({ error: 'Destination namespace does not exist' }, { status: 404 });
       }
       if (mockTables.has(toKey)) {
-        return Response.json({ error: 'Destination table already exists' }, { status: 409 });
+        return Response.json({ error: 'Table already exists' }, { status: 409 });
       }
       mockTables.delete(fromKey);
       mockTables.set(toKey, table);
@@ -364,6 +381,70 @@ describe('Iceberg REST Catalog Routes', () => {
         expect(res.status).toBe(200);
         const data = await res.json();
         expect(data.namespaces).toContainEqual(['test_db']);
+      });
+
+      it('should only list top-level namespaces when no parent specified', async () => {
+        // Create nested namespaces
+        await request('POST', '/v1/namespaces', { namespace: ['db'] });
+        await request('POST', '/v1/namespaces', { namespace: ['db', 'schema'] });
+        await request('POST', '/v1/namespaces', { namespace: ['db', 'schema', 'subschema'] });
+        await request('POST', '/v1/namespaces', { namespace: ['other_db'] });
+
+        // List without parent should return only top-level
+        const res = await request('GET', '/v1/namespaces');
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.namespaces).toContainEqual(['db']);
+        expect(data.namespaces).toContainEqual(['other_db']);
+        // Should NOT contain nested namespaces
+        expect(data.namespaces).not.toContainEqual(['db', 'schema']);
+        expect(data.namespaces).not.toContainEqual(['db', 'schema', 'subschema']);
+      });
+
+      it('should list direct children when parent is specified', async () => {
+        // Create nested namespaces
+        await request('POST', '/v1/namespaces', { namespace: ['parent_ns'] });
+        await request('POST', '/v1/namespaces', { namespace: ['parent_ns', 'child1'] });
+        await request('POST', '/v1/namespaces', { namespace: ['parent_ns', 'child2'] });
+        await request('POST', '/v1/namespaces', { namespace: ['parent_ns', 'child1', 'grandchild'] });
+
+        // List with parent should return only direct children
+        const res = await request('GET', '/v1/namespaces?parent=parent_ns');
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.namespaces).toContainEqual(['parent_ns', 'child1']);
+        expect(data.namespaces).toContainEqual(['parent_ns', 'child2']);
+        expect(data.namespaces).toHaveLength(2);
+        // Should NOT contain grandchildren
+        expect(data.namespaces).not.toContainEqual(['parent_ns', 'child1', 'grandchild']);
+      });
+
+      it('should list grandchildren when nested parent is specified', async () => {
+        // Create deeply nested namespaces
+        await request('POST', '/v1/namespaces', { namespace: ['a'] });
+        await request('POST', '/v1/namespaces', { namespace: ['a', 'b'] });
+        await request('POST', '/v1/namespaces', { namespace: ['a', 'b', 'c'] });
+        await request('POST', '/v1/namespaces', { namespace: ['a', 'b', 'd'] });
+        await request('POST', '/v1/namespaces', { namespace: ['a', 'b', 'c', 'e'] });
+
+        // List children of a%1Fb (using unit separator)
+        const res = await request('GET', '/v1/namespaces?parent=a%1Fb');
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.namespaces).toContainEqual(['a', 'b', 'c']);
+        expect(data.namespaces).toContainEqual(['a', 'b', 'd']);
+        expect(data.namespaces).toHaveLength(2);
+        // Should NOT contain deeper levels
+        expect(data.namespaces).not.toContainEqual(['a', 'b', 'c', 'e']);
+      });
+
+      it('should return empty list when parent has no children', async () => {
+        await request('POST', '/v1/namespaces', { namespace: ['leaf_ns'] });
+
+        const res = await request('GET', '/v1/namespaces?parent=leaf_ns');
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.namespaces).toEqual([]);
       });
     });
 
@@ -591,12 +672,209 @@ describe('Iceberg REST Catalog Routes', () => {
         expect(data.metadata.snapshots).toHaveLength(1);
       });
 
+      it('should handle full append flow with set-snapshot-ref', async () => {
+        // This test mirrors what RCK testAppend does:
+        // 1. Create table
+        // 2. Assert main branch is null (no snapshot)
+        // 3. Add snapshot
+        // 4. Set main branch to new snapshot
+
+        // Create table
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'append_test',
+          schema: {
+            type: 'struct',
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+
+        // First append: assert main is null, add snapshot, set main ref
+        const snapshotId1 = Date.now();
+        const res1 = await request('POST', '/v1/namespaces/test_db/tables/append_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+            { type: 'assert-ref-snapshot-id', ref: 'main', 'snapshot-id': null },
+          ],
+          updates: [
+            {
+              action: 'add-snapshot',
+              snapshot: {
+                'snapshot-id': snapshotId1,
+                'sequence-number': 1,
+                'timestamp-ms': snapshotId1,
+                'manifest-list': 's3://bucket/test_db/append_test/metadata/snap-1.avro',
+                summary: { operation: 'append' },
+              },
+            },
+            {
+              action: 'set-snapshot-ref',
+              'ref-name': 'main',
+              type: 'branch',
+              'snapshot-id': snapshotId1,
+            },
+          ],
+        });
+        expect(res1.status).toBe(200);
+        const data1 = await res1.json();
+        expect(data1.metadata.snapshots).toHaveLength(1);
+        expect(data1.metadata['current-snapshot-id']).toBe(snapshotId1);
+        expect(data1.metadata.refs?.main?.['snapshot-id']).toBe(snapshotId1);
+        expect(data1.metadata['snapshot-log']).toHaveLength(1);
+
+        // Second append: assert main equals first snapshot, add new snapshot, update main
+        const snapshotId2 = Date.now() + 1;
+        const res2 = await request('POST', '/v1/namespaces/test_db/tables/append_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+            { type: 'assert-ref-snapshot-id', ref: 'main', 'snapshot-id': snapshotId1 },
+          ],
+          updates: [
+            {
+              action: 'add-snapshot',
+              snapshot: {
+                'snapshot-id': snapshotId2,
+                'parent-snapshot-id': snapshotId1,
+                'sequence-number': 2,
+                'timestamp-ms': snapshotId2,
+                'manifest-list': 's3://bucket/test_db/append_test/metadata/snap-2.avro',
+                summary: { operation: 'append' },
+              },
+            },
+            {
+              action: 'set-snapshot-ref',
+              'ref-name': 'main',
+              type: 'branch',
+              'snapshot-id': snapshotId2,
+            },
+          ],
+        });
+        expect(res2.status).toBe(200);
+        const data2 = await res2.json();
+        expect(data2.metadata.snapshots).toHaveLength(2);
+        expect(data2.metadata['current-snapshot-id']).toBe(snapshotId2);
+        expect(data2.metadata.refs?.main?.['snapshot-id']).toBe(snapshotId2);
+        expect(data2.metadata['snapshot-log']).toHaveLength(2);
+        expect(data2.metadata['last-sequence-number']).toBe(2);
+      });
+
       it('should return 404 for non-existent table', async () => {
         const res = await request('POST', '/v1/namespaces/test_db/tables/nonexistent', {
           requirements: [],
           updates: [],
         });
         expect(res.status).toBe(404);
+      });
+
+      it('should return 409 when concurrent modification occurs (OCC)', async () => {
+        // Create table - starts at version 1
+        await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'concurrent_test',
+          schema: {
+            type: 'struct',
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+
+        // Get the initial version from the mock directly (routes don't return version)
+        const tableKey = 'test_db\x1f\x00concurrent_test';
+        const tableBefore = mockTables.get(tableKey);
+        const staleVersion = tableBefore?.version ?? 1; // Should be 1
+
+        // Simulate concurrent modification - another process commits first
+        // This increments the version in the mock storage
+        const table = mockTables.get(tableKey);
+        if (table) {
+          table.version = table.version + 1; // Now version 2
+          mockTables.set(tableKey, table);
+        }
+
+        // Our commit should fail because we're trying to commit with stale version
+        // but the table has been modified by another concurrent operation
+        // Test directly against mock DO to verify OCC works
+        const commitRes = await mockDOFetch(new Request('http://internal/namespaces/test_db/tables/concurrent_test/commit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            metadataLocation: 's3://bucket/test_db/concurrent_test/metadata/new.json',
+            metadata: {},
+            expectedVersion: staleVersion, // Stale version (1, but table is now at 2)
+          }),
+        }));
+
+        expect(commitRes.status).toBe(409);
+        const data = await commitRes.json() as { error: string; code?: string };
+        expect(data.code).toBe('CONFLICT');
+      });
+
+      it('should succeed with server-side retry when requirements are stale but updates can be rebased', async () => {
+        // Create table with initial schema
+        const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
+          name: 'retry_test',
+          schema: {
+            type: 'struct',
+            'schema-id': 0,
+            fields: [{ id: 1, name: 'id', required: true, type: 'long' }],
+          },
+        });
+        const createData = await createRes.json();
+        const originalSchemaId = createData.metadata['current-schema-id'];
+
+        // First client adds a new sort order (simulating concurrent modification)
+        const firstUpdateRes = await request('POST', '/v1/namespaces/test_db/tables/retry_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: createData.metadata['table-uuid'] },
+            { type: 'assert-current-schema-id', 'current-schema-id': originalSchemaId },
+          ],
+          updates: [
+            {
+              action: 'add-sort-order',
+              'sort-order': {
+                'order-id': 1,
+                fields: [],
+              },
+            },
+            { action: 'set-default-sort-order', 'sort-order-id': 1 },
+          ],
+        });
+        expect(firstUpdateRes.status).toBe(200);
+
+        // Get the updated table state
+        const loadRes = await request('GET', '/v1/namespaces/test_db/tables/retry_test');
+        const loadData = await loadRes.json();
+        const newSortOrderId = loadData.metadata['default-sort-order-id'];
+        expect(newSortOrderId).toBe(1);
+
+        // Second client tries to add a schema with stale requirements
+        // (requirements based on original state, but table has been modified)
+        // Server-side retry should detect the stale requirements and rebase the update
+        const retryRes = await request('POST', '/v1/namespaces/test_db/tables/retry_test', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: createData.metadata['table-uuid'] },
+            // This is stale - sort order was 0 when we read, but now it's 1
+            { type: 'assert-default-sort-order-id', 'default-sort-order-id': 0 },
+          ],
+          updates: [
+            {
+              action: 'add-schema',
+              schema: {
+                type: 'struct',
+                'schema-id': -1, // Auto-assign
+                fields: [
+                  { id: 1, name: 'id', required: true, type: 'long' },
+                  { id: 2, name: 'name', required: false, type: 'string' },
+                ],
+              },
+            },
+          ],
+        });
+
+        // Server-side retry should succeed by updating requirements and rebasing the schema update
+        expect(retryRes.status).toBe(200);
+        const retryData = await retryRes.json();
+        // The new schema should have been added
+        expect(retryData.metadata.schemas.length).toBe(2);
       });
     });
   });

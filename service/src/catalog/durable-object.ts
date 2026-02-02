@@ -729,6 +729,7 @@ export class CatalogDO extends DurableObject<Env> {
    * Create a table entry.
    * @throws NamespaceNotFoundError if namespace doesn't exist
    * @throws TableAlreadyExistsError if table already exists
+   * @throws ViewAlreadyExistsError if a view with the same name already exists
    */
   async createTable(
     namespace: string[],
@@ -746,6 +747,12 @@ export class CatalogDO extends DurableObject<Env> {
     const nsExists = await this.namespaceExists(namespace);
     if (!nsExists) {
       throw new NamespaceNotFoundError(namespace);
+    }
+
+    // Check if a view with the same name already exists (cross-type conflict)
+    const viewExists = await this.viewExists(namespace, name);
+    if (viewExists) {
+      throw new ViewAlreadyExistsError(namespace, name);
     }
 
     const now = Date.now();
@@ -967,6 +974,7 @@ export class CatalogDO extends DurableObject<Env> {
    * @throws TableNotFoundError if source table doesn't exist
    * @throws NamespaceNotFoundError if destination namespace doesn't exist
    * @throws TableAlreadyExistsError if destination table already exists
+   * @throws ViewAlreadyExistsError if a view with the destination name already exists
    */
   async renameTable(
     fromNamespace: string[],
@@ -996,6 +1004,12 @@ export class CatalogDO extends DurableObject<Env> {
       const destExists = await this.tableExists(toNamespace, toName);
       if (destExists) {
         throw new TableAlreadyExistsError(toNamespace, toName);
+      }
+
+      // Check if a view with the destination name already exists (cross-type conflict)
+      const viewExists = await this.viewExists(toNamespace, toName);
+      if (viewExists) {
+        throw new ViewAlreadyExistsError(toNamespace, toName);
       }
 
       const now = Date.now();
@@ -1053,6 +1067,7 @@ export class CatalogDO extends DurableObject<Env> {
    * Create a view.
    * @throws NamespaceNotFoundError if namespace doesn't exist
    * @throws ViewAlreadyExistsError if view already exists
+   * @throws TableAlreadyExistsError if a table with the same name already exists
    */
   async createView(
     namespace: string[],
@@ -1067,6 +1082,12 @@ export class CatalogDO extends DurableObject<Env> {
     const nsExists = await this.namespaceExists(namespace);
     if (!nsExists) {
       throw new NamespaceNotFoundError(namespace);
+    }
+
+    // Check if a table with the same name already exists (cross-type conflict)
+    const tableExists = await this.tableExists(namespace, name);
+    if (tableExists) {
+      throw new TableAlreadyExistsError(namespace, name);
     }
 
     const now = Date.now();
@@ -1213,6 +1234,7 @@ export class CatalogDO extends DurableObject<Env> {
    * @throws ViewNotFoundError if source view doesn't exist
    * @throws NamespaceNotFoundError if destination namespace doesn't exist
    * @throws ViewAlreadyExistsError if destination view already exists
+   * @throws TableAlreadyExistsError if a table with the destination name already exists
    */
   async renameView(
     sourceNamespace: string[],
@@ -1242,6 +1264,12 @@ export class CatalogDO extends DurableObject<Env> {
       const destExists = await this.viewExists(destNamespace, destName);
       if (destExists) {
         throw new ViewAlreadyExistsError(destNamespace, destName);
+      }
+
+      // Check if a table with the destination name already exists (cross-type conflict)
+      const tableExists = await this.tableExists(destNamespace, destName);
+      if (tableExists) {
+        throw new TableAlreadyExistsError(destNamespace, destName);
       }
 
       const now = Date.now();

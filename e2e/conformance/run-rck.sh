@@ -51,7 +51,7 @@ if command -v docker &> /dev/null; then
         -Drck.uri="$ICEBERG_DO_URL" \
         -Drck.warehouse="$WAREHOUSE" \
         -Drck.requires-namespace-create=true \
-        -Drck.supports-serverside-retry=false \
+        -Drck.supports-serverside-retry=true \
         --info
 
     echo ""

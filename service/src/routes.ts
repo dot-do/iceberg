@@ -327,48 +327,6 @@ function isValidFieldId(id: unknown): id is number {
 }
 
 /**
- * Find the maximum valid field ID in a schema (first pass).
- * Returns 0 if no valid field IDs are found.
- */
-function findMaxValidFieldId(schema: IcebergSchema): number {
-  let maxId = 0;
-
-  function traverse(type: string | IcebergSchema | IcebergListType | IcebergMapType): void {
-    if (typeof type === 'string') return;
-
-    if ('fields' in type && Array.isArray(type.fields)) {
-      for (const field of type.fields) {
-        if (isValidFieldId(field.id)) {
-          maxId = Math.max(maxId, field.id);
-        }
-        traverse(field.type);
-      }
-    }
-
-    if ('element-id' in type) {
-      if (isValidFieldId(type['element-id'])) {
-        maxId = Math.max(maxId, type['element-id']);
-      }
-      traverse(type.element);
-    }
-
-    if ('key-id' in type) {
-      if (isValidFieldId(type['key-id'])) {
-        maxId = Math.max(maxId, type['key-id']);
-      }
-      if (isValidFieldId(type['value-id'])) {
-        maxId = Math.max(maxId, type['value-id']);
-      }
-      traverse(type.key);
-      traverse(type.value);
-    }
-  }
-
-  traverse(schema);
-  return maxId;
-}
-
-/**
  * Context for assigning field IDs during schema normalization.
  */
 interface FieldIdContext {
@@ -634,22 +592,6 @@ function reassignType(type: string | IcebergSchema | IcebergListType | IcebergMa
 }
 
 /**
- * Deep copy a schema field preserving field IDs exactly (legacy function).
- */
-function deepCopyField(field: IcebergField): IcebergField {
-  const ctx: FieldIdContext = { nextId: 1 };
-  return normalizeField(field, ctx);
-}
-
-/**
- * Deep copy a type preserving IDs (legacy function).
- */
-function deepCopyType(type: string | IcebergSchema | IcebergListType | IcebergMapType): string | IcebergSchema | IcebergListType | IcebergMapType {
-  const ctx: FieldIdContext = { nextId: 1 };
-  return normalizeType(type, ctx);
-}
-
-/**
  * Create default table metadata.
  *
  * This function normalizes the schema by reassigning all field IDs sequentially
@@ -854,10 +796,18 @@ function applyUpdates(
 
       case 'add-schema': {
         // Ensure schema-id is a valid non-negative integer
+        // Per Iceberg spec, -1 means "assign the next available schema ID"
         const providedSchemaId = update.schema['schema-id'];
-        const schemaId = (typeof providedSchemaId === 'number' && providedSchemaId >= 0)
-          ? providedSchemaId
-          : result.schemas.length;
+        let schemaId: number;
+        if (typeof providedSchemaId === 'number' && providedSchemaId >= 0) {
+          schemaId = providedSchemaId;
+        } else {
+          // Calculate the next available schema ID (max existing + 1)
+          const maxExistingSchemaId = result.schemas.length > 0
+            ? Math.max(...result.schemas.map(s => s['schema-id'] ?? 0))
+            : -1;
+          schemaId = maxExistingSchemaId + 1;
+        }
         const newSchema = {
           ...update.schema,
           'schema-id': schemaId,
@@ -901,12 +851,28 @@ function applyUpdates(
       }
 
       case 'add-spec': {
-        const specId = update.spec['spec-id'];
-        result['partition-specs'] = [...(result['partition-specs'] ?? []), update.spec];
+        // Per Iceberg spec, -1 means "assign the next available spec ID"
+        const providedSpecId = update.spec['spec-id'];
+        let specId: number;
+        if (typeof providedSpecId === 'number' && providedSpecId >= 0) {
+          specId = providedSpecId;
+        } else {
+          // Calculate the next available spec ID (max existing + 1)
+          const existingSpecs = result['partition-specs'] ?? [];
+          const maxExistingSpecId = existingSpecs.length > 0
+            ? Math.max(...existingSpecs.map(s => s['spec-id']))
+            : -1;
+          specId = maxExistingSpecId + 1;
+        }
+        const newSpec = {
+          ...update.spec,
+          'spec-id': specId,
+        };
+        result['partition-specs'] = [...(result['partition-specs'] ?? []), newSpec];
         // Track this as the most recently added spec for potential -1 reference
         lastAddedSpecId = specId;
         // Update last-partition-id to track the max partition field ID
-        const maxPartitionId = findMaxPartitionFieldId(update.spec);
+        const maxPartitionId = findMaxPartitionFieldId(newSpec);
         result['last-partition-id'] = Math.max(result['last-partition-id'] ?? 999, maxPartitionId);
         break;
       }
@@ -920,13 +886,34 @@ function applyUpdates(
           }
           specId = lastAddedSpecId;
         }
+        // Validate spec-id exists in partition-specs
+        const specExists = (result['partition-specs'] ?? []).some(s => s['spec-id'] === specId);
+        if (!specExists) {
+          throw new Error(`Cannot find partition spec with spec-id=${specId} from partition-specs`);
+        }
         result['default-spec-id'] = specId;
         break;
       }
 
       case 'add-sort-order': {
-        const sortOrderId = update['sort-order']['order-id'];
-        result['sort-orders'] = [...(result['sort-orders'] ?? []), update['sort-order']];
+        // Per Iceberg spec, -1 means "assign the next available sort order ID"
+        const providedSortOrderId = update['sort-order']['order-id'];
+        let sortOrderId: number;
+        if (typeof providedSortOrderId === 'number' && providedSortOrderId >= 0) {
+          sortOrderId = providedSortOrderId;
+        } else {
+          // Calculate the next available sort order ID (max existing + 1)
+          const existingSortOrders = result['sort-orders'] ?? [];
+          const maxExistingSortOrderId = existingSortOrders.length > 0
+            ? Math.max(...existingSortOrders.map(s => s['order-id']))
+            : -1;
+          sortOrderId = maxExistingSortOrderId + 1;
+        }
+        const newSortOrder = {
+          ...update['sort-order'],
+          'order-id': sortOrderId,
+        };
+        result['sort-orders'] = [...(result['sort-orders'] ?? []), newSortOrder];
         // Track this as the most recently added sort order for potential -1 reference
         lastAddedSortOrderId = sortOrderId;
         break;
@@ -940,6 +927,11 @@ function applyUpdates(
             throw new Error('Cannot set default sort order to -1: no sort order was added in this update request');
           }
           sortOrderId = lastAddedSortOrderId;
+        }
+        // Validate sort-order-id exists in sort-orders
+        const sortOrderExists = (result['sort-orders'] ?? []).some(s => s['order-id'] === sortOrderId);
+        if (!sortOrderExists) {
+          throw new Error(`Cannot find sort order with order-id=${sortOrderId} from sort-orders`);
         }
         result['default-sort-order-id'] = sortOrderId;
         break;
@@ -1002,6 +994,107 @@ function applyUpdates(
 
   result['last-updated-ms'] = Date.now();
   return normalizeTableMetadata(result);
+}
+
+/**
+ * Update requirements to match the current metadata state.
+ * Used for server-side retry to rebase the client's updates onto the current state.
+ *
+ * This function updates the requirements so they expect the current metadata state,
+ * allowing the same updates to be re-applied on top of the new state.
+ */
+function updateRequirementsForCurrentState(
+  metadata: TableMetadata,
+  requirements: TableRequirement[]
+): TableRequirement[] {
+  return requirements.map(req => {
+    switch (req.type) {
+      case 'assert-create':
+        // Cannot rebase a create - table now exists
+        return req;
+
+      case 'assert-table-uuid':
+        // UUID should match - this typically shouldn't change
+        return { ...req, uuid: metadata['table-uuid'] };
+
+      case 'assert-ref-snapshot-id': {
+        // Update to current snapshot for this ref
+        const currentSnapshotId = metadata.refs?.[req.ref]?.['snapshot-id'] ?? null;
+        return { ...req, 'snapshot-id': currentSnapshotId };
+      }
+
+      case 'assert-last-assigned-field-id':
+        return { ...req, 'last-assigned-field-id': metadata['last-column-id'] };
+
+      case 'assert-current-schema-id':
+        return { ...req, 'current-schema-id': metadata['current-schema-id'] };
+
+      case 'assert-last-assigned-partition-id':
+        return { ...req, 'last-assigned-partition-id': metadata['last-partition-id'] ?? 999 };
+
+      case 'assert-default-spec-id':
+        return { ...req, 'default-spec-id': metadata['default-spec-id'] };
+
+      case 'assert-default-sort-order-id':
+        return { ...req, 'default-sort-order-id': metadata['default-sort-order-id'] };
+
+      default:
+        return req;
+    }
+  });
+}
+
+/**
+ * Check if updates can be safely rebased onto new metadata.
+ * Some updates reference specific IDs that might conflict with the new state.
+ */
+function canRebaseUpdates(
+  updates: TableUpdate[],
+  currentMetadata: TableMetadata
+): boolean {
+  for (const update of updates) {
+    switch (update.action) {
+      case 'add-schema': {
+        // Check if the schema ID already exists (only if explicitly set)
+        const schemaId = update.schema['schema-id'];
+        if (schemaId !== undefined && schemaId >= 0) {
+          if (currentMetadata.schemas.some(s => s['schema-id'] === schemaId)) {
+            return false; // Schema ID conflict
+          }
+        }
+        break;
+      }
+      case 'add-spec': {
+        // Check if the spec ID already exists (only if explicitly set)
+        const specId = update.spec['spec-id'];
+        if (specId !== undefined && specId >= 0) {
+          if ((currentMetadata['partition-specs'] ?? []).some(s => s['spec-id'] === specId)) {
+            return false; // Spec ID conflict
+          }
+        }
+        break;
+      }
+      case 'add-sort-order': {
+        // Check if the sort order ID already exists (only if explicitly set)
+        const orderId = update['sort-order']['order-id'];
+        if (orderId !== undefined && orderId >= 0) {
+          if ((currentMetadata['sort-orders'] ?? []).some(s => s['order-id'] === orderId)) {
+            return false; // Sort order ID conflict
+          }
+        }
+        break;
+      }
+      case 'add-snapshot': {
+        // Check if the snapshot ID already exists
+        const snapshotId = update.snapshot['snapshot-id'];
+        if ((currentMetadata.snapshots ?? []).some(s => s['snapshot-id'] === snapshotId)) {
+          return false; // Snapshot ID conflict
+        }
+        break;
+      }
+    }
+  }
+  return true;
 }
 
 /**
@@ -1165,7 +1258,10 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
   });
 
   // -------------------------------------------------------------------------
-  // GET /namespaces - List all namespaces
+  // GET /namespaces - List namespaces
+  // Per Iceberg REST spec:
+  // - When `parent` is not provided, return only top-level namespaces (depth=1)
+  // - When `parent` is provided, return only direct children of that parent
   // -------------------------------------------------------------------------
   api.get('/namespaces', requireNamespacePermission('namespace:list'), async (c) => {
     try {
@@ -1178,15 +1274,20 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       let namespaces = data.namespaces;
 
       if (parentParam) {
+        // Return only direct children of the specified parent
         const parent = parseNamespace(parentParam);
         namespaces = namespaces.filter(ns => {
-          // Return namespaces that are direct children of parent
+          // Direct children have exactly one more level than the parent
           if (ns.length !== parent.length + 1) return false;
+          // All parent components must match
           for (let i = 0; i < parent.length; i++) {
             if (ns[i] !== parent[i]) return false;
           }
           return true;
         });
+      } else {
+        // No parent specified - return only top-level namespaces (depth=1)
+        namespaces = namespaces.filter(ns => ns.length === 1);
       }
 
       return c.json({ namespaces });
@@ -1491,8 +1592,13 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
       if (!response.ok) {
         const error = await response.json() as { error: string };
-        if (response.status === 409 || error.error?.includes('UNIQUE constraint')) {
+        // Check for table already exists
+        if (response.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('Table already exists')) {
           return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+        }
+        // Check for cross-type conflict (view exists with same name)
+        if (error.error?.includes('View already exists')) {
+          return icebergError(c, `View already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
         if (response.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
           return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
@@ -1680,184 +1786,251 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
   // POST /namespaces/{namespace}/tables/{table} - Commit table changes
   // -------------------------------------------------------------------------
   api.post('/namespaces/:namespace/tables/:table', requireTablePermission('table:commit'), async (c) => {
-    try {
-      const namespaceParam = c.req.param('namespace');
-      const tableName = c.req.param('table');
-      const namespace = parseNamespace(namespaceParam);
-      const body = await c.req.json() as CommitTableRequest;
+    const MAX_RETRIES = 3;
 
-      const catalog = getCatalogStub(c);
+    const namespaceParam = c.req.param('namespace');
+    const tableName = c.req.param('table');
+    const namespace = parseNamespace(namespaceParam);
+    const body = await c.req.json() as CommitTableRequest;
 
-      // Check if this is a create transaction (assert-create requirement)
-      const hasAssertCreate = (body.requirements ?? []).some(r => r.type === 'assert-create');
+    const catalog = getCatalogStub(c);
 
-      // Load current table metadata
-      const loadResponse = await catalog.fetch(
-        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables/${encodeURIComponent(tableName)}`)
-      );
+    // Check if this is a create transaction (assert-create requirement)
+    const hasAssertCreate = (body.requirements ?? []).some(r => r.type === 'assert-create');
 
-      let currentMetadata: TableMetadata | null = null;
-      let tableData: { location: string; metadataLocation: string; metadata?: TableMetadata } | null = null;
+    // Server-side retry loop for concurrent modifications
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        // Load current table metadata
+        const loadResponse = await catalog.fetch(
+          new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables/${encodeURIComponent(tableName)}`)
+        );
 
-      if (loadResponse.ok) {
-        tableData = await loadResponse.json() as {
-          location: string;
-          metadataLocation: string;
-          metadata?: TableMetadata;
-        };
-        currentMetadata = tableData.metadata ?? null;
+        let currentMetadata: TableMetadata | null = null;
+        let tableData: { location: string; metadataLocation: string; metadata?: TableMetadata; version?: number } | null = null;
 
-        // Try to load from R2 if not in catalog
-        if (!currentMetadata && c.env.R2_BUCKET) {
-          const metadataPath = tableData.metadataLocation.replace('s3://iceberg-tables/', '');
-          const object = await c.env.R2_BUCKET.get(metadataPath);
-          if (object) {
-            currentMetadata = await object.json() as TableMetadata;
+        if (loadResponse.ok) {
+          tableData = await loadResponse.json() as {
+            location: string;
+            metadataLocation: string;
+            metadata?: TableMetadata;
+            version?: number;
+          };
+          currentMetadata = tableData.metadata ?? null;
+
+          // Try to load from R2 if not in catalog
+          if (!currentMetadata && c.env.R2_BUCKET) {
+            const metadataPath = tableData.metadataLocation.replace('s3://iceberg-tables/', '');
+            const object = await c.env.R2_BUCKET.get(metadataPath);
+            if (object) {
+              currentMetadata = await object.json() as TableMetadata;
+            }
+          }
+        } else if (!hasAssertCreate) {
+          // Table doesn't exist and this isn't a create transaction
+          return icebergError(
+            c,
+            `Table does not exist: ${namespace.join('.')}.${tableName}`,
+            'NoSuchTableException',
+            404
+          );
+        }
+
+        // Validate requirements against current state
+        const originalRequirements = body.requirements ?? [];
+        let requirements = originalRequirements;
+        const updates = body.updates ?? [];
+        const validation = validateRequirements(currentMetadata, requirements);
+
+        if (!validation.valid) {
+          // Requirements don't match current state - check if server-side retry is possible
+          // Server-side retry only applies when there are actual updates to rebase
+          if (currentMetadata !== null && !hasAssertCreate && updates.length > 0) {
+            // Check if updates can be safely rebased onto the new metadata
+            if (canRebaseUpdates(updates, currentMetadata)) {
+              // Updates can be rebased - use server-side retry
+              // Update requirements to match current state and continue
+              requirements = updateRequirementsForCurrentState(currentMetadata, requirements);
+
+              // Validate updated requirements (should pass now)
+              const retriedValidation = validateRequirements(currentMetadata, requirements);
+              if (!retriedValidation.valid) {
+                // This shouldn't happen if updateRequirementsForCurrentState works correctly
+                return icebergError(c, retriedValidation.message!, 'CommitFailedException', 409);
+              }
+              // Continue with the commit using updated requirements
+            } else {
+              // Cannot rebase - there's a true conflict (e.g., duplicate IDs)
+              return icebergError(
+                c,
+                'Commit conflict: updates cannot be applied to current table state due to conflicting changes',
+                'CommitFailedException',
+                409
+              );
+            }
+          } else {
+            // No updates to rebase, table doesn't exist, or this is a create - can't retry
+            return icebergError(c, validation.message!, 'CommitFailedException', 409);
           }
         }
-      } else if (!hasAssertCreate) {
-        // Table doesn't exist and this isn't a create transaction
+
+        // For create transactions, we need to build the initial metadata from the updates
+        let newMetadata: TableMetadata;
+        if (hasAssertCreate && currentMetadata === null) {
+          // This is a create transaction - build initial metadata from updates
+          // First, find the assign-uuid and set-location updates to get the basics
+          let tableUuid = crypto.randomUUID();
+          let tableLocation = '';
+
+          for (const update of body.updates ?? []) {
+            if (update.action === 'assign-uuid') {
+              tableUuid = update.uuid;
+            } else if (update.action === 'set-location') {
+              tableLocation = update.location;
+            }
+          }
+
+          if (!tableLocation) {
+            // Default location if not provided
+            const warehousePrefix = c.env.R2_BUCKET ? 's3://iceberg-tables' : 'file:///warehouse';
+            tableLocation = `${warehousePrefix}/${namespace.join('/')}/${tableName}`;
+          }
+
+          // Create minimal skeleton metadata (no schemas yet - they'll come from updates)
+          const now = Date.now();
+          const baseMetadata: TableMetadata = {
+            'format-version': 2,
+            'table-uuid': tableUuid,
+            location: tableLocation,
+            'last-sequence-number': 0,
+            'last-updated-ms': now,
+            'last-column-id': 0,
+            'current-schema-id': 0,
+            schemas: [],  // Will be populated by add-schema updates
+            'default-spec-id': 0,
+            'partition-specs': [],  // Will be populated by add-spec updates
+            'last-partition-id': 999,
+            'default-sort-order-id': 0,
+            'sort-orders': [],  // Will be populated by add-sort-order updates
+            properties: {},
+            snapshots: [],
+            'snapshot-log': [],
+            'metadata-log': [],
+            refs: {},
+          };
+
+          // Apply all updates to the base metadata
+          newMetadata = applyUpdates(baseMetadata, body.updates ?? []);
+        } else {
+          // Apply updates to existing metadata
+          newMetadata = applyUpdates(currentMetadata!, body.updates ?? []);
+        }
+
+        // Generate new metadata location
+        const seqNum = (newMetadata['last-sequence-number'] ?? 0).toString().padStart(5, '0');
+        const newMetadataLocation = `${newMetadata.location}/metadata/${seqNum}-${newMetadata['table-uuid']}.metadata.json`;
+
+        // If this is an update (not a create), add the previous metadata location to metadata-log
+        if (tableData?.metadataLocation && currentMetadata !== null) {
+          newMetadata['metadata-log'] = [
+            ...(newMetadata['metadata-log'] ?? []),
+            {
+              'timestamp-ms': currentMetadata['last-updated-ms'],
+              'metadata-file': tableData.metadataLocation,
+            },
+          ];
+        }
+
+        // Write new metadata to R2
+        if (c.env.R2_BUCKET) {
+          const metadataPath = newMetadataLocation.replace('s3://iceberg-tables/', '');
+          await c.env.R2_BUCKET.put(metadataPath, JSON.stringify(newMetadata, null, 2), {
+            httpMetadata: { contentType: 'application/json' },
+          });
+        }
+
+        if (hasAssertCreate && currentMetadata === null) {
+          // Create the table in the catalog
+          const createResponse = await catalog.fetch(
+            new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                name: tableName,
+                location: newMetadata.location,
+                metadataLocation: newMetadataLocation,
+                metadata: newMetadata,
+                properties: newMetadata.properties ?? {},
+              }),
+            })
+          );
+
+          if (!createResponse.ok) {
+            const error = await createResponse.json() as { error: string };
+            if (createResponse.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('already exists')) {
+              return icebergError(c, `Table already exists: ${namespace.join('.')}.${tableName}`, 'AlreadyExistsException', 409);
+            }
+            if (createResponse.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
+              return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
+            }
+            throw new Error(error.error || 'Failed to create table');
+          }
+        } else {
+          // Update catalog with new metadata location
+          // Pass expectedVersion for OCC to detect concurrent modifications
+          const commitResponse = await catalog.fetch(
+            new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables/${encodeURIComponent(tableName)}/commit`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                metadataLocation: newMetadataLocation,
+                metadata: newMetadata,
+                expectedVersion: tableData?.version,
+              }),
+            })
+          );
+
+          if (!commitResponse.ok) {
+            const error = await commitResponse.json() as { error: string; code?: string };
+            // Handle OCC conflict - another concurrent operation modified the table
+            if (commitResponse.status === 409 || error.code === 'CONFLICT') {
+              // Server-side retry: continue the loop to retry with fresh metadata
+              if (attempt < MAX_RETRIES - 1) {
+                continue;
+              }
+              return icebergError(
+                c,
+                'Commit conflict: table was modified by another concurrent operation',
+                'CommitFailedException',
+                409
+              );
+            }
+            throw new Error(error.error || 'Failed to commit table changes');
+          }
+        }
+
+        return c.json({
+          'metadata-location': newMetadataLocation,
+          metadata: newMetadata,
+        });
+      } catch (error) {
+        // Don't retry on non-conflict errors
         return icebergError(
           c,
-          `Table does not exist: ${namespace.join('.')}.${tableName}`,
-          'NoSuchTableException',
-          404
+          error instanceof Error ? error.message : 'Failed to commit table changes',
+          'ServiceFailureException',
+          500
         );
       }
-
-      // Validate requirements
-      const validation = validateRequirements(currentMetadata, body.requirements ?? []);
-      if (!validation.valid) {
-        return icebergError(c, validation.message!, 'CommitFailedException', 409);
-      }
-
-      // For create transactions, we need to build the initial metadata from the updates
-      let newMetadata: TableMetadata;
-      if (hasAssertCreate && currentMetadata === null) {
-        // This is a create transaction - build initial metadata from updates
-        // First, find the assign-uuid and set-location updates to get the basics
-        let tableUuid = crypto.randomUUID();
-        let tableLocation = '';
-
-        for (const update of body.updates ?? []) {
-          if (update.action === 'assign-uuid') {
-            tableUuid = update.uuid;
-          } else if (update.action === 'set-location') {
-            tableLocation = update.location;
-          }
-        }
-
-        if (!tableLocation) {
-          // Default location if not provided
-          const warehousePrefix = c.env.R2_BUCKET ? 's3://iceberg-tables' : 'file:///warehouse';
-          tableLocation = `${warehousePrefix}/${namespace.join('/')}/${tableName}`;
-        }
-
-        // Create minimal skeleton metadata (no schemas yet - they'll come from updates)
-        const now = Date.now();
-        const baseMetadata: TableMetadata = {
-          'format-version': 2,
-          'table-uuid': tableUuid,
-          location: tableLocation,
-          'last-sequence-number': 0,
-          'last-updated-ms': now,
-          'last-column-id': 0,
-          'current-schema-id': 0,
-          schemas: [],  // Will be populated by add-schema updates
-          'default-spec-id': 0,
-          'partition-specs': [],  // Will be populated by add-spec updates
-          'last-partition-id': 999,
-          'default-sort-order-id': 0,
-          'sort-orders': [],  // Will be populated by add-sort-order updates
-          properties: {},
-          snapshots: [],
-          'snapshot-log': [],
-          'metadata-log': [],
-          refs: {},
-        };
-
-        // Apply all updates to the base metadata
-        newMetadata = applyUpdates(baseMetadata, body.updates ?? []);
-      } else {
-        // Apply updates to existing metadata
-        newMetadata = applyUpdates(currentMetadata!, body.updates ?? []);
-      }
-
-      // Generate new metadata location
-      const seqNum = (newMetadata['last-sequence-number'] ?? 0).toString().padStart(5, '0');
-      const newMetadataLocation = `${newMetadata.location}/metadata/${seqNum}-${newMetadata['table-uuid']}.metadata.json`;
-
-      // If this is an update (not a create), add the previous metadata location to metadata-log
-      if (tableData?.metadataLocation && currentMetadata !== null) {
-        newMetadata['metadata-log'] = [
-          ...(newMetadata['metadata-log'] ?? []),
-          {
-            'timestamp-ms': currentMetadata['last-updated-ms'],
-            'metadata-file': tableData.metadataLocation,
-          },
-        ];
-      }
-
-      // Write new metadata to R2
-      if (c.env.R2_BUCKET) {
-        const metadataPath = newMetadataLocation.replace('s3://iceberg-tables/', '');
-        await c.env.R2_BUCKET.put(metadataPath, JSON.stringify(newMetadata, null, 2), {
-          httpMetadata: { contentType: 'application/json' },
-        });
-      }
-
-      if (hasAssertCreate && currentMetadata === null) {
-        // Create the table in the catalog
-        const createResponse = await catalog.fetch(
-          new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name: tableName,
-              location: newMetadata.location,
-              metadataLocation: newMetadataLocation,
-              metadata: newMetadata,
-              properties: newMetadata.properties ?? {},
-            }),
-          })
-        );
-
-        if (!createResponse.ok) {
-          const error = await createResponse.json() as { error: string };
-          if (createResponse.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('already exists')) {
-            return icebergError(c, `Table already exists: ${namespace.join('.')}.${tableName}`, 'AlreadyExistsException', 409);
-          }
-          if (createResponse.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
-            return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
-          }
-          throw new Error(error.error || 'Failed to create table');
-        }
-      } else {
-        // Update catalog with new metadata location
-        await catalog.fetch(
-          new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables/${encodeURIComponent(tableName)}/commit`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              metadataLocation: newMetadataLocation,
-              metadata: newMetadata,
-            }),
-          })
-        );
-      }
-
-      return c.json({
-        'metadata-location': newMetadataLocation,
-        metadata: newMetadata,
-      });
-    } catch (error) {
-      return icebergError(
-        c,
-        error instanceof Error ? error.message : 'Failed to commit table changes',
-        'ServiceFailureException',
-        500
-      );
     }
+
+    // Exhausted all retries
+    return icebergError(
+      c,
+      'Commit failed after maximum retries due to concurrent modifications',
+      'CommitFailedException',
+      409
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -1906,10 +2079,20 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
             404
           );
         }
-        if (error.error?.includes('already exists')) {
+        // Check for table already exists at destination
+        if (error.error?.includes('Table already exists')) {
           return icebergError(
             c,
             `Table already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
+            'AlreadyExistsException',
+            409
+          );
+        }
+        // Check for cross-type conflict (view exists at destination)
+        if (error.error?.includes('View already exists')) {
+          return icebergError(
+            c,
+            `View already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
             'AlreadyExistsException',
             409
           );
@@ -1947,14 +2130,29 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
       const metadataLocation = body['metadata-location'];
 
-      // Load metadata from the provided location (R2)
+      // Load metadata from the provided location
+      // Try R2 first if the path matches our R2 bucket, otherwise try HTTP/HTTPS
       let metadata: TableMetadata | null = null;
-      if (c.env.R2_BUCKET) {
+
+      // Try R2 bucket if available and path starts with our S3 prefix
+      if (c.env.R2_BUCKET && metadataLocation.startsWith('s3://iceberg-tables/')) {
         const metadataPath = metadataLocation.replace('s3://iceberg-tables/', '');
         const object = await c.env.R2_BUCKET.get(metadataPath);
-
         if (object) {
           metadata = await object.json() as TableMetadata;
+        }
+      }
+
+      // Fallback: Try HTTP/HTTPS fetch for external URLs
+      // This supports RCK tests with external S3 or presigned URLs
+      if (!metadata && (metadataLocation.startsWith('http://') || metadataLocation.startsWith('https://'))) {
+        try {
+          const response = await fetch(metadataLocation);
+          if (response.ok) {
+            metadata = await response.json() as TableMetadata;
+          }
+        } catch {
+          // HTTP fetch failed, will return error below
         }
       }
 
@@ -2129,8 +2327,13 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
 
       if (!response.ok) {
         const error = await response.json() as { error: string };
-        if (response.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('already exists')) {
+        // Check for view already exists
+        if (response.status === 409 || error.error?.includes('UNIQUE constraint') || error.error?.includes('View already exists')) {
           return icebergError(c, `View already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
+        }
+        // Check for cross-type conflict (table exists with same name)
+        if (error.error?.includes('Table already exists')) {
+          return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExistsException', 409);
         }
         if (response.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
           return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespaceException', 404);
@@ -2306,10 +2509,10 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         }
       }
 
-      // Update view in catalog
+      // Update view in catalog (POST to view endpoint for replace operation)
       const updateResponse = await catalog.fetch(
         new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/views/${encodeURIComponent(viewName)}`, {
-          method: 'PUT',
+          method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             metadata: newMetadata,
@@ -2392,17 +2595,18 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            fromNamespace: body.source.namespace,
-            fromName: body.source.name,
-            toNamespace: body.destination.namespace,
-            toName: body.destination.name,
+            sourceNamespace: body.source.namespace,
+            sourceName: body.source.name,
+            destNamespace: body.destination.namespace,
+            destName: body.destination.name,
           }),
         })
       );
 
       if (!response.ok) {
-        const error = await response.json() as { error: string };
-        if (error.error?.includes('not found') || error.error?.includes('does not exist')) {
+        const error = await response.json() as { error: string; code?: string };
+        // Check for view not found
+        if (error.error?.includes('View does not exist') || error.code === 'NOT_FOUND') {
           return icebergError(
             c,
             `View does not exist: ${body.source.namespace.join('.')}.${body.source.name}`,
@@ -2410,10 +2614,29 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
             404
           );
         }
-        if (error.error?.includes('already exists')) {
+        // Check for namespace not found
+        if (error.error?.includes('Namespace does not exist')) {
+          return icebergError(
+            c,
+            `Namespace does not exist: ${body.destination.namespace.join('.')}`,
+            'NoSuchNamespaceException',
+            404
+          );
+        }
+        // Check for view already exists at destination
+        if (error.error?.includes('View already exists')) {
           return icebergError(
             c,
             `View already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
+            'AlreadyExistsException',
+            409
+          );
+        }
+        // Check for cross-type conflict (table exists at destination)
+        if (error.error?.includes('Table already exists')) {
+          return icebergError(
+            c,
+            `Table already exists: ${body.destination.namespace.join('.')}.${body.destination.name}`,
             'AlreadyExistsException',
             409
           );

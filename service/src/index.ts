@@ -16,7 +16,6 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { createIcebergRoutes } from './routes.js';
-import { CatalogDO, CatalogDOv2 } from './catalog/durable-object.js';
 import { createD1CatalogHandler } from './catalog/d1.js';
 import { createAuthMiddleware, createAuthorizationMiddleware, type OAuthService, type AuthVariables, type AuthorizationVariables } from './auth/index.js';
 
