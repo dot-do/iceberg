@@ -23,6 +23,37 @@ echo "Iceberg:  $ICEBERG_VERSION"
 echo "Warehouse: $WAREHOUSE"
 echo ""
 
+# Clean up the catalog before running tests
+# The RCK tests expect an empty catalog
+echo "Cleaning up catalog..."
+if command -v jq &>/dev/null; then
+    # Use jq for robust JSON parsing
+    # Delete all namespaces (which deletes their contents too, if cascade is supported)
+    # First, delete all tables and views, then namespaces
+    namespaces=$(curl -s "$ICEBERG_DO_URL/v1/namespaces" | jq -r '.namespaces[][] // empty' 2>/dev/null || true)
+    for ns in $namespaces; do
+        if [ -n "$ns" ]; then
+            echo "  Cleaning namespace: $ns"
+            # Delete tables
+            tables=$(curl -s "$ICEBERG_DO_URL/v1/namespaces/$ns/tables" | jq -r '.identifiers[].name // empty' 2>/dev/null || true)
+            for table in $tables; do
+                [ -n "$table" ] && curl -s -X DELETE "$ICEBERG_DO_URL/v1/namespaces/$ns/tables/$table?purgeRequested=true" > /dev/null || true
+            done
+            # Delete views
+            views=$(curl -s "$ICEBERG_DO_URL/v1/namespaces/$ns/views" | jq -r '.identifiers[].name // empty' 2>/dev/null || true)
+            for view in $views; do
+                [ -n "$view" ] && curl -s -X DELETE "$ICEBERG_DO_URL/v1/namespaces/$ns/views/$view" > /dev/null || true
+            done
+            # Delete namespace
+            curl -s -X DELETE "$ICEBERG_DO_URL/v1/namespaces/$ns" > /dev/null || true
+        fi
+    done
+    echo "  Cleanup complete"
+else
+    echo "  Warning: jq not available, skipping cleanup (install jq for clean catalog)"
+fi
+echo ""
+
 # Check for Java first (preferred for speed)
 if java -version &>/dev/null; then
     echo "Running RCK with local Java..."
