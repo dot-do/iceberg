@@ -658,4 +658,217 @@ describe('Iceberg REST Catalog Routes', () => {
       expect(res.status).toBe(409);
     });
   });
+
+  // =========================================================================
+  // Table Registration
+  // =========================================================================
+  describe('POST /v1/namespaces/{namespace}/register', () => {
+    let appWithR2: Hono<{ Bindings: MockEnv; Variables: MockVariables }>;
+    let envWithR2: MockEnv;
+
+    // Mock R2 storage for metadata files
+    const mockR2Storage = new Map<string, unknown>();
+
+    function createMockR2Bucket(): MockR2Bucket {
+      return {
+        put: async (key: string, value: string) => {
+          mockR2Storage.set(key, JSON.parse(value));
+        },
+        get: async (key: string) => {
+          const data = mockR2Storage.get(key);
+          if (data) {
+            return { json: async () => data };
+          }
+          return null;
+        },
+        list: async (options?: { prefix?: string }) => {
+          const objects: Array<{ key: string }> = [];
+          for (const key of mockR2Storage.keys()) {
+            if (!options?.prefix || key.startsWith(options.prefix)) {
+              objects.push({ key });
+            }
+          }
+          return { objects };
+        },
+        delete: async (keys: string[]) => {
+          for (const key of keys) {
+            mockR2Storage.delete(key);
+          }
+        },
+      };
+    }
+
+    beforeEach(async () => {
+      resetMockStorage();
+      mockR2Storage.clear();
+
+      envWithR2 = {
+        ...createMockEnv(),
+        R2_BUCKET: createMockR2Bucket(),
+      };
+
+      appWithR2 = new Hono<{ Bindings: MockEnv; Variables: MockVariables }>();
+      appWithR2.use('/*', async (c, next) => {
+        c.set('catalogStub', { fetch: mockDOFetch });
+        c.set('auth', createMockAuthContext());
+        c.set('authorization', createMockAuthorizationContext());
+        return next();
+      });
+      appWithR2.route('/v1', createIcebergRoutes() as Hono<{ Bindings: MockEnv; Variables: MockVariables }>);
+
+      // Create a namespace for register tests
+      await appWithR2.fetch(
+        new Request('http://test/v1/namespaces', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ namespace: ['test_db'] }),
+        }),
+        envWithR2
+      );
+    });
+
+    async function requestWithR2(method: string, path: string, body?: unknown): Promise<Response> {
+      const req = new Request(`http://test${path}`, {
+        method,
+        headers: body ? { 'Content-Type': 'application/json' } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return appWithR2.fetch(req, envWithR2);
+    }
+
+    it('should register an existing table', async () => {
+      // First, create metadata in R2 to simulate an existing table
+      const metadataLocation = 's3://iceberg-tables/test_db/existing_table/metadata/00000-abc123.metadata.json';
+      const metadata = {
+        'format-version': 2,
+        'table-uuid': 'abc123-uuid',
+        location: 's3://iceberg-tables/test_db/existing_table',
+        'last-updated-ms': Date.now(),
+        'last-column-id': 2,
+        'current-schema-id': 0,
+        schemas: [{
+          type: 'struct',
+          'schema-id': 0,
+          fields: [
+            { id: 1, name: 'id', required: true, type: 'long' },
+            { id: 2, name: 'name', required: false, type: 'string' },
+          ],
+        }],
+        'default-spec-id': 0,
+        'partition-specs': [{ 'spec-id': 0, fields: [] }],
+        'last-partition-id': 999,
+        'default-sort-order-id': 0,
+        'sort-orders': [{ 'order-id': 0, fields: [] }],
+        properties: { owner: 'test-user' },
+      };
+
+      // Store metadata in mock R2
+      mockR2Storage.set('test_db/existing_table/metadata/00000-abc123.metadata.json', metadata);
+
+      // Register the table
+      const res = await requestWithR2('POST', '/v1/namespaces/test_db/register', {
+        name: 'existing_table',
+        'metadata-location': metadataLocation,
+      });
+
+      expect(res.status).toBe(200);
+      const data = await res.json();
+      expect(data['metadata-location']).toBe(metadataLocation);
+      expect(data.metadata['table-uuid']).toBe('abc123-uuid');
+      expect(data.metadata.location).toBe('s3://iceberg-tables/test_db/existing_table');
+
+      // Verify table is now accessible via normal load
+      const loadRes = await requestWithR2('GET', '/v1/namespaces/test_db/tables/existing_table');
+      expect(loadRes.status).toBe(200);
+    });
+
+    it('should return 400 for missing name', async () => {
+      const res = await requestWithR2('POST', '/v1/namespaces/test_db/register', {
+        'metadata-location': 's3://bucket/path/to/metadata.json',
+      });
+      expect(res.status).toBe(400);
+      const data = await res.json();
+      expect(data.error.message).toContain('name');
+    });
+
+    it('should return 400 for missing metadata-location', async () => {
+      const res = await requestWithR2('POST', '/v1/namespaces/test_db/register', {
+        name: 'test_table',
+      });
+      expect(res.status).toBe(400);
+      const data = await res.json();
+      expect(data.error.message).toContain('Metadata location');
+    });
+
+    it('should return 400 when metadata cannot be loaded', async () => {
+      const res = await requestWithR2('POST', '/v1/namespaces/test_db/register', {
+        name: 'nonexistent_table',
+        'metadata-location': 's3://iceberg-tables/path/to/nonexistent/metadata.json',
+      });
+      expect(res.status).toBe(400);
+      const data = await res.json();
+      expect(data.error.message).toContain('Unable to load metadata');
+    });
+
+    it('should return 409 when table already exists', async () => {
+      // Create metadata in R2
+      const metadata = {
+        'format-version': 2,
+        'table-uuid': 'duplicate-uuid',
+        location: 's3://iceberg-tables/test_db/duplicate_table',
+        'last-updated-ms': Date.now(),
+        'last-column-id': 1,
+        'current-schema-id': 0,
+        schemas: [{ type: 'struct', 'schema-id': 0, fields: [] }],
+        'default-spec-id': 0,
+        'partition-specs': [{ 'spec-id': 0, fields: [] }],
+        'last-partition-id': 999,
+        'default-sort-order-id': 0,
+        'sort-orders': [{ 'order-id': 0, fields: [] }],
+      };
+      mockR2Storage.set('test_db/duplicate_table/metadata/00000.metadata.json', metadata);
+
+      // Register the table first time
+      await requestWithR2('POST', '/v1/namespaces/test_db/register', {
+        name: 'duplicate_table',
+        'metadata-location': 's3://iceberg-tables/test_db/duplicate_table/metadata/00000.metadata.json',
+      });
+
+      // Try to register again
+      const res = await requestWithR2('POST', '/v1/namespaces/test_db/register', {
+        name: 'duplicate_table',
+        'metadata-location': 's3://iceberg-tables/test_db/duplicate_table/metadata/00000.metadata.json',
+      });
+      expect(res.status).toBe(409);
+      const data = await res.json();
+      expect(data.error.type).toBe('AlreadyExists');
+    });
+
+    it('should return 404 for non-existent namespace', async () => {
+      // Create metadata in R2
+      const metadata = {
+        'format-version': 2,
+        'table-uuid': 'orphan-uuid',
+        location: 's3://iceberg-tables/nonexistent_ns/orphan_table',
+        'last-updated-ms': Date.now(),
+        'last-column-id': 1,
+        'current-schema-id': 0,
+        schemas: [{ type: 'struct', 'schema-id': 0, fields: [] }],
+        'default-spec-id': 0,
+        'partition-specs': [{ 'spec-id': 0, fields: [] }],
+        'last-partition-id': 999,
+        'default-sort-order-id': 0,
+        'sort-orders': [{ 'order-id': 0, fields: [] }],
+      };
+      mockR2Storage.set('nonexistent_ns/orphan_table/metadata/00000.metadata.json', metadata);
+
+      const res = await requestWithR2('POST', '/v1/namespaces/nonexistent_ns/register', {
+        name: 'orphan_table',
+        'metadata-location': 's3://iceberg-tables/nonexistent_ns/orphan_table/metadata/00000.metadata.json',
+      });
+      expect(res.status).toBe(404);
+      const data = await res.json();
+      expect(data.error.type).toBe('NoSuchNamespace');
+    });
+  });
 });

@@ -292,11 +292,12 @@ export function createAuthMiddleware<E extends EnvWithOAuth, V extends AuthVaria
   const publicPaths = config.publicPaths ?? ['/health', '/v1/config'];
 
   return async (c: Context<{ Bindings: E; Variables: V }>, next: Next): Promise<Response | void> => {
-    // Skip auth if disabled
+    // Skip auth if disabled - grant full admin access
     if (!config.enabled) {
       c.set('auth', {
-        authenticated: false,
-        roles: [],
+        authenticated: true,
+        userId: 'anonymous',
+        roles: ['admin', 'owner'],
       } as AuthContext);
       await next();
       return;

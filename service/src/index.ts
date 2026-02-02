@@ -16,12 +16,12 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { createIcebergRoutes } from './routes.js';
-import { CatalogDO } from './catalog/durable-object.js';
+import { CatalogDO, CatalogDOv2 } from './catalog/durable-object.js';
 import { createD1CatalogHandler } from './catalog/d1.js';
-import { createAuthMiddleware, type OAuthService, type AuthVariables } from './auth/index.js';
+import { createAuthMiddleware, createAuthorizationMiddleware, type OAuthService, type AuthVariables, type AuthorizationVariables } from './auth/index.js';
 
-// Re-export the Durable Object class for wrangler
-export { CatalogDO };
+// Re-export the Durable Object classes for wrangler
+export { CatalogDO, CatalogDOv2 } from './catalog/durable-object.js';
 
 // Re-export catalog types
 export * from './catalog/types.js';
@@ -62,8 +62,8 @@ export interface Env {
   CATALOG_BACKEND?: 'durable-object' | 'd1';
 }
 
-// Hono variable types - use AuthVariables from the auth module
-type Variables = AuthVariables & {
+// Hono variable types - use AuthVariables and AuthorizationVariables from the auth module
+type Variables = AuthVariables & AuthorizationVariables & {
   // Catalog stub for backend-agnostic access
   catalogStub: { fetch: (request: Request) => Promise<Response> };
 };
@@ -115,6 +115,11 @@ app.use('/*', async (c, next) => {
 
   return authMiddleware(c, next);
 });
+
+// Authorization middleware - sets up FGA engine for permission checks
+app.use('/*', createAuthorizationMiddleware({
+  skipPaths: ['/health', '/', '/v1/config'],
+}));
 
 // Health check endpoint
 app.get('/health', (c) => {

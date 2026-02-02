@@ -210,18 +210,19 @@ describe('Auth Middleware', () => {
       app = new Hono<{ Bindings: EnvWithOAuth }>();
     });
 
-    it('should skip authentication when disabled', async () => {
+    it('should grant full admin access when authentication is disabled', async () => {
       const middleware = createAuthMiddleware({ enabled: false });
       app.use('*', middleware);
       app.get('/test', (c) => {
         const auth = getAuthContext(c);
-        return c.json({ authenticated: auth.authenticated });
+        return c.json({ authenticated: auth.authenticated, roles: auth.roles });
       });
 
       const res = await app.fetch(new Request('http://test/test'));
       expect(res.status).toBe(200);
       const data = await res.json();
-      expect(data.authenticated).toBe(false);
+      expect(data.authenticated).toBe(true);
+      expect(data.roles).toContain('admin');
     });
 
     it('should allow access to public paths without authentication', async () => {

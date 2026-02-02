@@ -316,38 +316,34 @@ export class CatalogDO extends DurableObject<Env> {
   // ==========================================================================
 
   /**
-   * Execute a function within a SQLite transaction.
-   * Automatically commits on success or rolls back on failure.
+   * Execute a function atomically.
+   *
+   * Note: Durable Objects guarantee single-threaded execution, so we get
+   * implicit transactional behavior. SQL `BEGIN TRANSACTION` is not allowed
+   * in DO SQLite - we rely on the single-threaded guarantee instead.
+   *
+   * For operations that need true atomicity across multiple SQL statements,
+   * use synchronous operations within the function.
    */
   private async transaction<T>(fn: () => T | Promise<T>): Promise<T> {
-    // Note: Durable Object SQLite runs in autocommit mode by default.
-    // For explicit transactions, we use BEGIN/COMMIT/ROLLBACK.
-    // However, since DO guarantees single-threaded execution,
-    // we get implicit transactional behavior for synchronous operations.
-
-    // For async operations, we need explicit transaction control
-    try {
-      this.sql.exec('BEGIN TRANSACTION');
-      const result = await fn();
-      this.sql.exec('COMMIT');
-      return result;
-    } catch (error) {
-      this.sql.exec('ROLLBACK');
-      throw error;
-    }
+    // Durable Objects guarantee single-threaded execution per object instance.
+    // This means no concurrent requests can interleave, providing implicit
+    // transactional behavior. SQL statements execute atomically individually.
+    return await fn();
   }
 
   /**
    * Execute multiple operations atomically.
-   * All operations must succeed or none will be applied.
+   * Due to DO's single-threaded guarantee, operations run without interleaving.
+   *
+   * Note: If an operation throws, subsequent operations won't run, but
+   * previously executed operations are NOT rolled back (no true SQL transaction).
    */
   async atomicBatch(operations: Array<() => void>): Promise<void> {
     await this.init();
-    await this.transaction(() => {
-      for (const op of operations) {
-        op();
-      }
-    });
+    for (const op of operations) {
+      op();
+    }
   }
 
   // ==========================================================================
@@ -1162,3 +1158,6 @@ export class CatalogDO extends DurableObject<Env> {
     }
   }
 }
+
+// Export alias for SQLite migration
+export { CatalogDO as CatalogDOv2 };

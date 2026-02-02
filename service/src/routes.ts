@@ -59,6 +59,12 @@ interface RenameTableRequest {
   destination: { namespace: string[]; name: string };
 }
 
+/** Request body for registering an existing table */
+interface RegisterTableRequest {
+  name: string;
+  'metadata-location': string;
+}
+
 /** Request body for updating namespace properties */
 interface UpdateNamespacePropertiesRequest {
   removals?: string[];
@@ -241,7 +247,75 @@ function icebergError(
 }
 
 /**
+ * Deep copy a schema field to preserve field IDs exactly.
+ */
+function deepCopyField(field: IcebergField): IcebergField {
+  const copy: IcebergField = {
+    id: field.id,
+    name: field.name,
+    required: field.required,
+    type: deepCopyType(field.type),
+  };
+  if (field.doc !== undefined) {
+    copy.doc = field.doc;
+  }
+  return copy;
+}
+
+/**
+ * Deep copy a type (handles nested structs, lists, maps).
+ */
+function deepCopyType(type: string | IcebergSchema | IcebergListType | IcebergMapType): string | IcebergSchema | IcebergListType | IcebergMapType {
+  if (typeof type === 'string') {
+    return type;
+  }
+
+  if ('fields' in type && type.type === 'struct') {
+    // It's a struct type
+    const result: IcebergSchema = {
+      type: 'struct',
+      fields: type.fields.map(deepCopyField),
+    };
+    if (type['schema-id'] !== undefined) {
+      result['schema-id'] = type['schema-id'];
+    }
+    if (type['identifier-field-ids'] !== undefined) {
+      result['identifier-field-ids'] = [...type['identifier-field-ids']];
+    }
+    return result;
+  }
+
+  if ('element-id' in type) {
+    // It's a list type
+    return {
+      type: 'list',
+      'element-id': type['element-id'],
+      element: deepCopyType(type.element),
+      'element-required': type['element-required'],
+    } as IcebergListType;
+  }
+
+  if ('key-id' in type) {
+    // It's a map type
+    return {
+      type: 'map',
+      'key-id': type['key-id'],
+      key: deepCopyType(type.key),
+      'value-id': type['value-id'],
+      value: deepCopyType(type.value),
+      'value-required': type['value-required'],
+    } as IcebergMapType;
+  }
+
+  // Fallback - return as is (should not happen with valid schemas)
+  return type;
+}
+
+/**
  * Create default table metadata.
+ *
+ * IMPORTANT: This function preserves the exact field IDs from the input schema.
+ * Field IDs are never reassigned - they are used exactly as provided in the request.
  */
 function createDefaultMetadata(
   tableUuid: string,
@@ -253,13 +327,21 @@ function createDefaultMetadata(
 ): TableMetadata {
   const now = Date.now();
 
-  // Ensure schema has an ID
+  // Deep copy the schema to ensure field IDs are preserved exactly as provided.
+  // This prevents any potential mutation of the original schema from affecting
+  // the stored metadata, and ensures field IDs are never reassigned.
   const normalizedSchema: IcebergSchema = {
-    ...schema,
+    type: 'struct',
     'schema-id': schema['schema-id'] ?? 0,
+    fields: schema.fields.map(deepCopyField),
   };
 
-  // Find max field ID in schema
+  // Copy identifier-field-ids if present
+  if (schema['identifier-field-ids']) {
+    normalizedSchema['identifier-field-ids'] = [...schema['identifier-field-ids']];
+  }
+
+  // Find max field ID in schema (used for last-column-id tracking)
   const maxFieldId = findMaxFieldId(normalizedSchema);
 
   // Default partition spec (unpartitioned)
@@ -356,9 +438,14 @@ function applyUpdates(
         break;
 
       case 'add-schema': {
+        // Ensure schema-id is a valid non-negative integer
+        const providedSchemaId = update.schema['schema-id'];
+        const schemaId = (typeof providedSchemaId === 'number' && providedSchemaId >= 0)
+          ? providedSchemaId
+          : result.schemas.length;
         const newSchema = {
           ...update.schema,
-          'schema-id': update.schema['schema-id'] ?? (result.schemas.length),
+          'schema-id': schemaId,
         };
         result.schemas = [...result.schemas, newSchema];
         if (update['last-column-id'] !== undefined) {
@@ -367,9 +454,19 @@ function applyUpdates(
         break;
       }
 
-      case 'set-current-schema':
-        result['current-schema-id'] = update['schema-id'];
+      case 'set-current-schema': {
+        const schemaId = update['schema-id'];
+        // Validate schema-id is non-negative and exists in schemas
+        if (typeof schemaId !== 'number' || schemaId < 0) {
+          throw new Error(`Invalid schema-id: ${schemaId}. Must be a non-negative integer.`);
+        }
+        const schemaExists = result.schemas.some(s => s['schema-id'] === schemaId);
+        if (!schemaExists) {
+          throw new Error(`Cannot find schema with current-schema-id=${schemaId} from schemas`);
+        }
+        result['current-schema-id'] = schemaId;
         break;
+      }
 
       case 'add-spec':
         result['partition-specs'] = [...result['partition-specs'], update.spec];
@@ -457,25 +554,25 @@ function validateRequirements(
     switch (req.type) {
       case 'assert-create':
         if (metadata !== null) {
-          return { valid: false, message: 'Table already exists' };
+          return { valid: false, message: 'Cannot commit: table already exists' };
         }
         break;
 
       case 'assert-table-uuid':
         if (!metadata || metadata['table-uuid'] !== req.uuid) {
-          return { valid: false, message: `Table UUID mismatch: expected ${req.uuid}` };
+          return { valid: false, message: `Cannot commit: table UUID mismatch expected ${req.uuid}, got ${metadata?.['table-uuid'] ?? 'null'}` };
         }
         break;
 
       case 'assert-ref-snapshot-id': {
         if (!metadata) {
-          return { valid: false, message: 'Table does not exist' };
+          return { valid: false, message: 'Cannot commit: table does not exist' };
         }
         const refSnapshotId = metadata.refs?.[req.ref]?.['snapshot-id'] ?? null;
         if (refSnapshotId !== req['snapshot-id']) {
           return {
             valid: false,
-            message: `Snapshot ID mismatch for ref ${req.ref}: expected ${req['snapshot-id']}, got ${refSnapshotId}`,
+            message: `Cannot commit: snapshot ID mismatch for ref ${req.ref} expected ${req['snapshot-id']}, got ${refSnapshotId}`,
           };
         }
         break;
@@ -485,7 +582,7 @@ function validateRequirements(
         if (!metadata || metadata['last-column-id'] !== req['last-assigned-field-id']) {
           return {
             valid: false,
-            message: `Last assigned field ID mismatch: expected ${req['last-assigned-field-id']}`,
+            message: `Cannot commit: last assigned field ID mismatch expected ${req['last-assigned-field-id']}, got ${metadata?.['last-column-id'] ?? 'null'}`,
           };
         }
         break;
@@ -494,7 +591,7 @@ function validateRequirements(
         if (!metadata || metadata['current-schema-id'] !== req['current-schema-id']) {
           return {
             valid: false,
-            message: `Current schema ID mismatch: expected ${req['current-schema-id']}`,
+            message: `Cannot commit: current schema ID mismatch expected ${req['current-schema-id']}, got ${metadata?.['current-schema-id'] ?? 'null'}`,
           };
         }
         break;
@@ -503,7 +600,7 @@ function validateRequirements(
         if (!metadata || metadata['last-partition-id'] !== req['last-assigned-partition-id']) {
           return {
             valid: false,
-            message: `Last assigned partition ID mismatch: expected ${req['last-assigned-partition-id']}`,
+            message: `Cannot commit: last assigned partition ID mismatch expected ${req['last-assigned-partition-id']}, got ${metadata?.['last-partition-id'] ?? 'null'}`,
           };
         }
         break;
@@ -512,7 +609,7 @@ function validateRequirements(
         if (!metadata || metadata['default-spec-id'] !== req['default-spec-id']) {
           return {
             valid: false,
-            message: `Default spec ID mismatch: expected ${req['default-spec-id']}`,
+            message: `Cannot commit: default spec ID mismatch expected ${req['default-spec-id']}, got ${metadata?.['default-spec-id'] ?? 'null'}`,
           };
         }
         break;
@@ -521,7 +618,7 @@ function validateRequirements(
         if (!metadata || metadata['default-sort-order-id'] !== req['default-sort-order-id']) {
           return {
             valid: false,
-            message: `Default sort order ID mismatch: expected ${req['default-sort-order-id']}`,
+            message: `Cannot commit: default sort order ID mismatch expected ${req['default-sort-order-id']}, got ${metadata?.['default-sort-order-id'] ?? 'null'}`,
           };
         }
         break;
@@ -547,6 +644,7 @@ function validateRequirements(
  * - POST /namespaces/{namespace}/properties - Update namespace properties
  * - GET /namespaces/{namespace}/tables - List tables
  * - POST /namespaces/{namespace}/tables - Create table
+ * - POST /namespaces/{namespace}/register - Register existing table
  * - GET /namespaces/{namespace}/tables/{table} - Load table
  * - DELETE /namespaces/{namespace}/tables/{table} - Drop table
  * - POST /namespaces/{namespace}/tables/{table} - Commit table changes
@@ -653,9 +751,9 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
   });
 
   // -------------------------------------------------------------------------
-  // GET /namespaces/{namespace} - Get namespace metadata
+  // GET/HEAD /namespaces/{namespace} - Get namespace metadata / Check exists
   // -------------------------------------------------------------------------
-  api.get('/namespaces/:namespace', requireNamespacePermission('namespace:read'), async (c) => {
+  api.on(['GET', 'HEAD'], '/namespaces/:namespace', requireNamespacePermission('namespace:read'), async (c) => {
     try {
       const namespaceParam = c.req.param('namespace');
       const namespace = parseNamespace(namespaceParam);
@@ -666,7 +764,16 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       );
 
       if (!response.ok) {
+        // HEAD returns 404, GET returns error JSON
+        if (c.req.method === 'HEAD') {
+          return c.body(null, 404);
+        }
         return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespace', 404);
+      }
+
+      // HEAD returns 204 No Content, GET returns full response
+      if (c.req.method === 'HEAD') {
+        return c.body(null, 204);
       }
 
       const data = await response.json() as { properties: Record<string, string> };
@@ -676,6 +783,9 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         properties: data.properties ?? {},
       });
     } catch (error) {
+      if (c.req.method === 'HEAD') {
+        return c.body(null, 500);
+      }
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to get namespace',
@@ -892,9 +1002,9 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
   });
 
   // -------------------------------------------------------------------------
-  // GET /namespaces/{namespace}/tables/{table} - Load table
+  // GET/HEAD /namespaces/{namespace}/tables/{table} - Load table / Check exists
   // -------------------------------------------------------------------------
-  api.get('/namespaces/:namespace/tables/:table', requireTablePermission('table:read'), async (c) => {
+  api.on(['GET', 'HEAD'], '/namespaces/:namespace/tables/:table', requireTablePermission('table:read'), async (c) => {
     try {
       const namespaceParam = c.req.param('namespace');
       const tableName = c.req.param('table');
@@ -906,12 +1016,21 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       );
 
       if (!response.ok) {
+        // HEAD returns 404, GET returns error JSON
+        if (c.req.method === 'HEAD') {
+          return c.body(null, 404);
+        }
         return icebergError(
           c,
           `Table does not exist: ${namespace.join('.')}.${tableName}`,
           'NoSuchTable',
           404
         );
+      }
+
+      // HEAD returns 204 No Content
+      if (c.req.method === 'HEAD') {
+        return c.body(null, 204);
       }
 
       const data = await response.json() as {
@@ -961,6 +1080,9 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
         },
       });
     } catch (error) {
+      if (c.req.method === 'HEAD') {
+        return c.body(null, 500);
+      }
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to load table',
@@ -1173,6 +1295,91 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
       return icebergError(
         c,
         error instanceof Error ? error.message : 'Failed to rename table',
+        'InternalServerError',
+        500
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /namespaces/{namespace}/register - Register existing table
+  // -------------------------------------------------------------------------
+  api.post('/namespaces/:namespace/register', requireTablePermission('table:create'), async (c) => {
+    try {
+      const namespaceParam = c.req.param('namespace');
+      const namespace = parseNamespace(namespaceParam);
+      const body = await c.req.json() as RegisterTableRequest;
+
+      if (!body.name) {
+        return icebergError(c, 'Table name is required', 'BadRequest', 400);
+      }
+
+      if (!body['metadata-location']) {
+        return icebergError(c, 'Metadata location is required', 'BadRequest', 400);
+      }
+
+      const metadataLocation = body['metadata-location'];
+
+      // Load metadata from the provided location (R2)
+      let metadata: TableMetadata | null = null;
+      if (c.env.R2_BUCKET) {
+        const metadataPath = metadataLocation.replace('s3://iceberg-tables/', '');
+        const object = await c.env.R2_BUCKET.get(metadataPath);
+
+        if (object) {
+          metadata = await object.json() as TableMetadata;
+        }
+      }
+
+      if (!metadata) {
+        return icebergError(
+          c,
+          `Unable to load metadata from location: ${metadataLocation}`,
+          'BadRequest',
+          400
+        );
+      }
+
+      // Extract table location from metadata
+      const tableLocation = metadata.location;
+
+      // Store table in catalog
+      const catalog = getCatalogStub(c);
+      const response = await catalog.fetch(
+        new Request(`http://internal/namespaces/${encodeURIComponent(namespace.join('\x1f'))}/tables`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: body.name,
+            location: tableLocation,
+            metadataLocation,
+            metadata,
+            properties: metadata.properties ?? {},
+          }),
+        })
+      );
+
+      if (!response.ok) {
+        const error = await response.json() as { error: string };
+        if (response.status === 409 || error.error?.includes('UNIQUE constraint')) {
+          return icebergError(c, `Table already exists: ${namespace.join('.')}.${body.name}`, 'AlreadyExists', 409);
+        }
+        if (response.status === 404 || error.error?.includes('Namespace does not exist') || error.error?.toLowerCase().includes('namespace')) {
+          return icebergError(c, `Namespace does not exist: ${namespace.join('.')}`, 'NoSuchNamespace', 404);
+        }
+        throw new Error(error.error || 'Failed to register table');
+      }
+
+      // Return LoadTableResponse format
+      return c.json({
+        'metadata-location': metadataLocation,
+        metadata,
+      });
+    } catch (error) {
+      if (error instanceof Response) throw error;
+      return icebergError(
+        c,
+        error instanceof Error ? error.message : 'Failed to register table',
         'InternalServerError',
         500
       );

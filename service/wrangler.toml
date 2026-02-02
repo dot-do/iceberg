@@ -1,17 +1,22 @@
 name = "iceberg-do"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
+account_id = "b6641681fe423910342b9ffa1364c76d"
 
 # Enable Durable Objects
 [durable_objects]
 bindings = [
-  { name = "CATALOG", class_name = "CatalogDO" }
+  { name = "CATALOG", class_name = "CatalogDOv2" }
 ]
 
-# Define the Durable Object class
+# Migration from non-SQLite to SQLite requires a new class name
 [[migrations]]
 tag = "v1"
 new_classes = ["CatalogDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CatalogDOv2"]
 
 # R2 bucket for table data
 [[r2_buckets]]
@@ -29,9 +34,10 @@ bucket_name = "iceberg-tables"
 # Service bindings - oauth.do for authentication
 # The OAUTH binding allows token validation via service-to-service calls
 # See https://oauth.do for documentation
-[[services]]
-binding = "OAUTH"
-service = "oauth-do"
+# Uncomment when oauth-do is deployed:
+# [[services]]
+# binding = "OAUTH"
+# service = "oauth-do"
 
 # Environment variables
 [vars]

@@ -158,6 +158,11 @@ export function requireNamespacePermission(
       );
     }
 
+    // Skip permission checks for admin/owner roles (they have full access)
+    if (auth.roles?.includes('admin') || auth.roles?.includes('owner')) {
+      return next();
+    }
+
     const namespaceValue = c.req.param(namespaceParam);
 
     // For routes without namespace parameter (e.g., list namespaces, create namespace),
@@ -237,6 +242,11 @@ export function requireTablePermission(
         },
         401
       );
+    }
+
+    // Skip permission checks for admin/owner roles (they have full access)
+    if (auth.roles?.includes('admin') || auth.roles?.includes('owner')) {
+      return next();
     }
 
     const namespaceValue = c.req.param(namespaceParam);
