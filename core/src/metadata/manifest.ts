@@ -242,6 +242,17 @@ export class ManifestListGenerator {
 
   /**
    * Add a manifest file with computed statistics.
+   *
+   * @param path - Path to the manifest file
+   * @param length - Length of the manifest file in bytes
+   * @param partitionSpecId - Partition spec ID used for this manifest
+   * @param summary - File and row count statistics
+   * @param isDeleteManifest - Whether this is a delete manifest (default: false)
+   * @param partitionSummaries - Optional partition field summaries
+   * @param firstRowId - Optional first row ID for v3 row lineage tracking.
+   *   - number: explicit first row ID for this manifest
+   *   - null: inherit from manifest list context
+   *   - undefined: field not included (v2 compatibility)
    */
   addManifestWithStats(
     path: string,
@@ -256,7 +267,8 @@ export class ManifestListGenerator {
       deletedRows: number;
     },
     isDeleteManifest: boolean = false,
-    partitionSummaries?: PartitionFieldSummary[]
+    partitionSummaries?: PartitionFieldSummary[],
+    firstRowId?: number | null
   ): void {
     const manifest: ManifestFile = {
       'manifest-path': path,
@@ -273,6 +285,8 @@ export class ManifestListGenerator {
       'existing-rows-count': summary.existingRows,
       'deleted-rows-count': summary.deletedRows,
       ...(partitionSummaries && partitionSummaries.length > 0 && { partitions: partitionSummaries }),
+      // Include first-row-id only if explicitly provided (not undefined)
+      ...(firstRowId !== undefined && { 'first-row-id': firstRowId }),
     };
 
     this.manifests.push(manifest);

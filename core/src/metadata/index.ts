@@ -10,6 +10,7 @@
 export {
   // Format version
   FORMAT_VERSION,
+  FORMAT_VERSION_3,
   // Metadata directory
   METADATA_DIR,
   VERSION_HINT_FILENAME,
@@ -59,6 +60,10 @@ export type {
   IcebergStructType,
   IcebergType,
   IcebergSchema,
+  // Geospatial types (v3)
+  EdgeInterpolationAlgorithm,
+  GeometryTypeInfo,
+  GeographyTypeInfo,
   // Partition and sort
   PartitionTransform,
   PartitionField,
@@ -71,6 +76,8 @@ export type {
   ColumnMetrics,
   BloomFilterRef,
   DataFile,
+  // Deletion vector validation
+  DeletionVectorValidationResult,
   // Manifest
   ManifestEntryStatus,
   ManifestEntry,
@@ -84,8 +91,30 @@ export type {
   Snapshot,
   // Table metadata
   TableMetadata,
+  // Encryption
+  EncryptionKey,
   // Storage
   StorageBackend,
+} from './types.js';
+
+// Geospatial type utilities (v3)
+export {
+  // Constants
+  VALID_EDGE_INTERPOLATION_ALGORITHMS,
+  GEOSPATIAL_DEFAULT_CRS,
+  GEOSPATIAL_DEFAULT_ALGORITHM,
+  // Functions
+  isGeospatialType,
+  isValidEdgeInterpolationAlgorithm,
+  parseGeometryType,
+  parseGeographyType,
+  serializeGeometryType,
+  serializeGeographyType,
+  // Deletion vector utilities
+  isDeletionVector,
+  validateDeletionVectorFields,
+  // Row lineage utilities (v3)
+  calculateRowId,
 } from './types.js';
 
 // Reader
@@ -155,6 +184,16 @@ export {
   type SchemaChangeType,
   type SchemaChange,
   type SchemaComparisonResult,
+  // Unknown type validation (v3)
+  validateUnknownTypeField,
+  validateSchema,
+  type FieldValidationResult,
+  // Default values validation (v3)
+  validateFieldDefault,
+  canChangeInitialDefault,
+  canChangeWriteDefault,
+  type FieldDefaultValidationOptions,
+  type DefaultChangeResult,
 } from './schema.js';
 
 // Schema Evolution (advanced)
@@ -333,3 +372,31 @@ export {
   type PendingCommit,
   type CommitResult,
 } from './commit.js';
+
+// Deletion Vectors (v3 feature)
+export {
+  // Entry creation
+  createDeletionVectorEntry,
+  // Scan planning
+  findDeletionVectorsForFile,
+  shouldIgnorePositionDeletes,
+  // V3 validation
+  validateV3DeletionVectorRules,
+  countDeletionVectorsPerDataFile,
+  // Types
+  type CreateDeletionVectorOptions,
+  type V3DeletionVectorValidationResult,
+} from './deletion-vectors.js';
+
+// Version Upgrade (v2 to v3)
+export {
+  // Upgrade functions
+  upgradeTableToV3,
+  upgradeTableToV3WithOptions,
+  canUpgradeToV3,
+  // Error handling
+  VersionUpgradeError,
+  // Types
+  type VersionUpgradeErrorCode,
+  type UpgradeOptions,
+} from './upgrade.js';

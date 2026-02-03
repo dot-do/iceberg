@@ -216,16 +216,145 @@ describe('Format Version Handling', () => {
   });
 
   describe('Format Version Type Safety', () => {
-    it('should have format-version typed as literal 2', () => {
+    it('should have format-version typed as 2 | 3 union', () => {
       const builder = new TableMetadataBuilder({
         location: 's3://bucket/table',
       });
       const metadata = builder.build();
 
       // TypeScript should enforce this at compile time
-      // At runtime we verify the value
-      const version: 2 = metadata['format-version'];
-      expect(version).toBe(2);
+      // At runtime we verify the value is in the union
+      const version: 2 | 3 = metadata['format-version'];
+      expect([2, 3]).toContain(version);
+    });
+  });
+
+  describe('Format Version 3 Support', () => {
+    it('should accept format-version 3 in TableMetadata', () => {
+      const builder = new TableMetadataBuilder({
+        location: 's3://bucket/table',
+        formatVersion: 3,
+      });
+      const metadata = builder.build();
+
+      expect(metadata['format-version']).toBe(3);
+    });
+
+    it('should create v3 tables with formatVersion: 3 option', () => {
+      const builder = new TableMetadataBuilder({
+        location: 's3://bucket/warehouse/db/table',
+        formatVersion: 3,
+        properties: {
+          'table.name': 'v3_table',
+        },
+      });
+      const metadata = builder.build();
+
+      expect(metadata['format-version']).toBe(3);
+      expect(metadata.location).toBe('s3://bucket/warehouse/db/table');
+      expect(metadata.properties['table.name']).toBe('v3_table');
+    });
+
+    it('should validate both v2 and v3 format versions', () => {
+      const storage = createMockStorage();
+      const writer = new MetadataWriter(storage);
+
+      // Create v2 metadata
+      const v2Metadata = writer.createTableMetadata({
+        location: 's3://bucket/table-v2',
+      });
+      expect(() => writer.validateMetadata(v2Metadata)).not.toThrow();
+
+      // Create v3 metadata
+      const v3Metadata = writer.createTableMetadata({
+        location: 's3://bucket/table-v3',
+        formatVersion: 3,
+      });
+      expect(() => writer.validateMetadata(v3Metadata)).not.toThrow();
+    });
+
+    it('should include format-version: 3 in JSON output', () => {
+      const builder = new TableMetadataBuilder({
+        location: 's3://bucket/table',
+        formatVersion: 3,
+      });
+      const json = builder.toJSON();
+
+      expect(json).toContain('"format-version": 3');
+    });
+
+    it('should default to format-version 2 for backward compatibility', () => {
+      const builder = new TableMetadataBuilder({
+        location: 's3://bucket/table',
+      });
+      const metadata = builder.build();
+
+      expect(metadata['format-version']).toBe(2);
+    });
+
+    it('should write format-version 3 to storage', async () => {
+      const storage = createMockStorage();
+      const writer = new MetadataWriter(storage);
+
+      const result = await writer.writeNewTable({
+        location: 's3://bucket/warehouse/db/table',
+        formatVersion: 3,
+      });
+
+      const data = storage.files.get(result.metadataLocation);
+      expect(data).toBeDefined();
+
+      const parsed = JSON.parse(new TextDecoder().decode(data!));
+      expect(parsed['format-version']).toBe(3);
+    });
+
+    it('should preserve format-version 3 through updates', async () => {
+      const storage = createMockStorage();
+      const writer = new MetadataWriter(storage);
+
+      const result1 = await writer.writeNewTable({
+        location: 's3://bucket/warehouse/db/table',
+        formatVersion: 3,
+      });
+
+      // Rebuild with modifications
+      const builder = TableMetadataBuilder.fromMetadata(result1.metadata);
+      builder.setProperty('test.key', 'test.value');
+      const modified = builder.build();
+
+      expect(modified['format-version']).toBe(3);
+    });
+
+    it('should reject format-version other than 2 or 3', () => {
+      const storage = createMockStorage();
+      const writer = new MetadataWriter(storage);
+
+      // Create invalid metadata with wrong format version
+      const invalidMetadata = {
+        'format-version': 1, // Invalid - should be 2 or 3
+        'table-uuid': 'test-uuid',
+        location: 's3://bucket/table',
+        'last-sequence-number': 0,
+        'last-updated-ms': Date.now(),
+        'last-column-id': 1,
+        'current-schema-id': 0,
+        schemas: [{ 'schema-id': 0, type: 'struct', fields: [] }],
+        'default-spec-id': 0,
+        'partition-specs': [{ 'spec-id': 0, fields: [] }],
+        'last-partition-id': 999,
+        'default-sort-order-id': 0,
+        'sort-orders': [{ 'order-id': 0, fields: [] }],
+        properties: {},
+        'current-snapshot-id': null,
+        snapshots: [],
+        'snapshot-log': [],
+        'metadata-log': [],
+        refs: {},
+      } as unknown as TableMetadata;
+
+      expect(() => writer.validateMetadata(invalidMetadata)).toThrow(
+        /format-version/
+      );
     });
   });
 

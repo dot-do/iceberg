@@ -434,15 +434,27 @@ describe('parseTableMetadata', () => {
       );
     });
 
-    it('should throw for format version 3', () => {
+    it('should accept format version 3', () => {
       const json = JSON.stringify({
         'format-version': 3,
         'table-uuid': 'test-uuid',
         location: tableLocation,
       });
 
+      // Format version 3 is now supported
+      const metadata = parseTableMetadata(json);
+      expect(metadata['format-version']).toBe(3);
+    });
+
+    it('should throw for format version 4', () => {
+      const json = JSON.stringify({
+        'format-version': 4,
+        'table-uuid': 'test-uuid',
+        location: tableLocation,
+      });
+
       expect(() => parseTableMetadata(json)).toThrow(
-        'Unsupported format version: 3'
+        'Unsupported format version: 4'
       );
     });
 

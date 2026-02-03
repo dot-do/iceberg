@@ -91,6 +91,58 @@ From **db4**: Bloom filters, row-level deletes, partition transforms, compaction
 From **MongoLake**: R2 Data Catalog client, schema tracker
 From **GitX**: Column statistics in manifests, zone map conversion
 
+### Variant Shredding Patterns
+
+Variant shredding allows decomposing semi-structured JSON/variant columns into separate typed columns for efficient querying. Key components:
+
+**Configuration (in `variant/config.ts`):**
+- `toTableProperties(configs)` - Convert shredding configs to Iceberg table properties
+- `extractVariantShredConfig(properties)` - Read configs from table properties
+- `validateShredConfig(config)` - Validate configuration before use
+
+**Statistics Paths (in `variant/statistics.ts`):**
+- Path format: `{column}.typed_value.{field}.typed_value`
+- `getStatisticsPaths(column, fields)` - Get stats paths for fields
+- `assignShreddedFieldIds(configs, startId)` - Assign unique field IDs
+
+**Filter Transformation (in `variant/filter.ts`):**
+- `transformVariantFilter(filter, configs)` - Rewrite filters to use stats paths
+- Transforms `$data.year` to `$data.typed_value.year.typed_value`
+
+**Stats Collection (in `variant/stats-collector.ts`):**
+- `collectShreddedColumnStats(columns, configs, startId)` - Collect min/max bounds
+- `addShreddedStatsToDataFile(dataFile, stats)` - Add stats to manifest entries
+
+**Predicate Pushdown (in `variant/row-group-filter.ts` and `variant/predicate-pushdown.ts`):**
+- `filterDataFiles(files, filter, configs, fieldIdMap)` - Skip files that don't match
+- `shouldSkipDataFile(file, filter, configs, fieldIdMap)` - Check individual file
+
+**Example Usage:**
+```typescript
+// 1. Configure shredding
+const config: VariantShredPropertyConfig = {
+  columnName: '$data',
+  fields: ['year', 'rating'],
+  fieldTypes: { year: 'int', rating: 'double' },
+};
+const tableProperties = toTableProperties([config]);
+
+// 2. Assign field IDs (start after schema max field ID)
+const fieldIdMap = assignShreddedFieldIds([config], 1000);
+
+// 3. Transform user filters
+const result = transformVariantFilter(
+  { '$data.year': { $gte: 2020 } },
+  [config]
+);
+// result.filter = { '$data.typed_value.year.typed_value': { $gte: 2020 } }
+
+// 4. Filter files during query planning
+const filesToScan = filterDataFiles(dataFiles, filter, [config], fieldIdMap);
+```
+
+See `core/examples/variant-shredding.ts` for complete examples.
+
 ## Testing
 
 Uses Vitest with Node environment. Tests are in `tests/` directories within each package.

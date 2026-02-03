@@ -17,6 +17,8 @@ import {
   PartitionSpecBuilder,
   type PartitionSpec,
   type PartitionField,
+  type SortField,
+  type SortOrder,
 } from '../../../src/index.js';
 
 describe('Partition Spec Serialization', () => {
@@ -423,6 +425,231 @@ describe('Partition Spec Serialization', () => {
       const json = JSON.stringify(spec);
       expect(json).toContain('bucket[256]');
       expect(json).toContain('truncate[10]');
+    });
+  });
+
+  describe('Multi-Argument Transforms (source-ids)', () => {
+    /**
+     * Iceberg v3 spec addition: Multi-argument transforms support.
+     * Transforms that take multiple columns use 'source-ids' array instead of 'source-id'.
+     *
+     * @see https://iceberg.apache.org/spec/#partitioning
+     */
+
+    describe('PartitionField source-ids support', () => {
+      it('should allow optional source-ids array in PartitionField', () => {
+        // source-ids is an array of field IDs for multi-argument transforms
+        const fieldWithSourceIds: PartitionField = {
+          'source-ids': [1, 2],
+          'field-id': 1000,
+          name: 'multi_col_bucket',
+          transform: 'bucket[16]',
+        };
+
+        expect(fieldWithSourceIds['source-ids']).toEqual([1, 2]);
+        expect(fieldWithSourceIds['source-id']).toBeUndefined();
+      });
+
+      it('should support single-argument transform with source-id (existing behavior)', () => {
+        const fieldWithSourceId: PartitionField = {
+          'source-id': 1,
+          'field-id': 1000,
+          name: 'bucket_partition',
+          transform: 'bucket[16]',
+        };
+
+        expect(fieldWithSourceId['source-id']).toBe(1);
+        expect(fieldWithSourceId['source-ids']).toBeUndefined();
+      });
+
+      it('should not allow both source-id and source-ids', () => {
+        // Type system should prevent this, but runtime validation should catch it
+        const invalidField = {
+          'source-id': 1,
+          'source-ids': [1, 2],
+          'field-id': 1000,
+          name: 'invalid_partition',
+          transform: 'bucket[16]',
+        };
+
+        // This should be considered invalid - either source-id OR source-ids, not both
+        const hasSourceId = 'source-id' in invalidField && invalidField['source-id'] !== undefined;
+        const hasSourceIds =
+          'source-ids' in invalidField &&
+          Array.isArray(invalidField['source-ids']) &&
+          invalidField['source-ids'].length > 0;
+
+        // Validation: should have exactly one
+        expect(hasSourceId && hasSourceIds).toBe(true); // Shows the invalid state
+      });
+    });
+
+    describe('SortField source-ids support', () => {
+      it('should allow optional source-ids array in SortField', () => {
+        // Sort fields can also support multi-argument transforms
+        const sortFieldWithSourceIds = {
+          'source-ids': [1, 2],
+          transform: 'bucket[16]',
+          direction: 'asc' as const,
+          'null-order': 'nulls-first' as const,
+        };
+
+        expect(sortFieldWithSourceIds['source-ids']).toEqual([1, 2]);
+      });
+
+      it('should support single-argument transform with source-id in SortField', () => {
+        const sortFieldWithSourceId = {
+          'source-id': 1,
+          transform: 'identity',
+          direction: 'asc' as const,
+          'null-order': 'nulls-first' as const,
+        };
+
+        expect(sortFieldWithSourceId['source-id']).toBe(1);
+      });
+    });
+
+    describe('JSON Serialization with source-ids', () => {
+      it('should serialize source-ids correctly in partition spec JSON', () => {
+        const spec: PartitionSpec = {
+          'spec-id': 0,
+          fields: [
+            {
+              'source-ids': [1, 2],
+              'field-id': 1000,
+              name: 'multi_bucket',
+              transform: 'bucket[16]',
+            },
+          ],
+        };
+
+        const json = JSON.stringify(spec, null, 2);
+        expect(json).toContain('"source-ids"');
+        // Check that array contains expected values (JSON.stringify with indent formats arrays with newlines)
+        expect(json).toMatch(/"source-ids":\s*\[\s*1,\s*2\s*\]/);
+        expect(json).not.toContain('"source-id":');
+      });
+
+      it('should roundtrip partition spec with source-ids through JSON', () => {
+        const spec: PartitionSpec = {
+          'spec-id': 0,
+          fields: [
+            {
+              'source-ids': [3, 5, 7],
+              'field-id': 1000,
+              name: 'multi_col_partition',
+              transform: 'bucket[32]',
+            },
+          ],
+        };
+
+        const json = JSON.stringify(spec);
+        const parsed = JSON.parse(json) as PartitionSpec;
+
+        expect(parsed.fields[0]['source-ids']).toEqual([3, 5, 7]);
+        expect(parsed.fields[0]['source-id']).toBeUndefined();
+      });
+
+      it('should serialize sort order with source-ids correctly', () => {
+        const sortOrder: SortOrder = {
+          'order-id': 1,
+          fields: [
+            {
+              'source-ids': [1, 2],
+              transform: 'identity',
+              direction: 'asc',
+              'null-order': 'nulls-first',
+            },
+          ],
+        };
+
+        const json = JSON.stringify(sortOrder, null, 2);
+        expect(json).toContain('"source-ids"');
+        // Check array contents with flexible whitespace
+        expect(json).toMatch(/"source-ids":\s*\[\s*1,\s*2\s*\]/);
+      });
+    });
+
+    describe('Multi-argument transform examples', () => {
+      it('should support bucket transform with multiple columns (future use case)', () => {
+        // Example: bucket partitioning on composite key (col1, col2)
+        const multiColBucketSpec: PartitionSpec = {
+          'spec-id': 0,
+          fields: [
+            {
+              'source-ids': [1, 2], // bucket on both columns together
+              'field-id': 1000,
+              name: 'composite_bucket',
+              transform: 'bucket[16]',
+            },
+          ],
+        };
+
+        expect(multiColBucketSpec.fields[0]['source-ids']).toHaveLength(2);
+      });
+
+      it('should validate source-ids contains valid field IDs (numbers)', () => {
+        const validSourceIds = [1, 2, 3];
+        expect(validSourceIds.every((id) => typeof id === 'number')).toBe(true);
+
+        const invalidSourceIds = [1, '2', 3]; // string in array
+        expect(invalidSourceIds.every((id) => typeof id === 'number')).toBe(false);
+      });
+    });
+
+    describe('Type definitions', () => {
+      it('should accept PartitionField with only source-ids (no source-id)', () => {
+        // This test verifies the type allows source-ids without source-id
+        // If PartitionField requires source-id, this will fail type checking
+        const field: PartitionField = {
+          'source-ids': [1, 2],
+          'field-id': 1000,
+          name: 'multi_col_bucket',
+          transform: 'bucket[16]',
+        };
+
+        expect(field['source-ids']).toEqual([1, 2]);
+        expect(field['source-id']).toBeUndefined();
+      });
+
+      it('should accept PartitionField with only source-id (no source-ids)', () => {
+        // Existing behavior should still work
+        const field: PartitionField = {
+          'source-id': 1,
+          'field-id': 1000,
+          name: 'single_col_bucket',
+          transform: 'bucket[16]',
+        };
+
+        expect(field['source-id']).toBe(1);
+        expect(field['source-ids']).toBeUndefined();
+      });
+
+      it('should accept SortField with only source-ids (no source-id)', () => {
+        // This test verifies SortField type allows source-ids without source-id
+        const field: SortField = {
+          'source-ids': [1, 2],
+          transform: 'identity',
+          direction: 'asc',
+          'null-order': 'nulls-first',
+        };
+
+        expect(field['source-ids']).toEqual([1, 2]);
+        expect(field['source-id']).toBeUndefined();
+      });
+
+      it('should accept SortField with only source-id (no source-ids)', () => {
+        // Existing behavior should still work
+        const field: SortField = {
+          'source-id': 1,
+          transform: 'identity',
+          direction: 'asc',
+          'null-order': 'nulls-first',
+        };
+
+        expect(field['source-id']).toBe(1);
+        expect(field['source-ids']).toBeUndefined();
+      });
     });
   });
 

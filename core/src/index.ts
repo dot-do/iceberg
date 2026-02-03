@@ -62,6 +62,8 @@ export type {
   ColumnMetrics,
   BloomFilterRef,
   DataFile,
+  // Deletion vector validation
+  DeletionVectorValidationResult,
   // Manifest
   ManifestEntryStatus,
   ManifestEntry,
@@ -77,6 +79,12 @@ export type {
   TableMetadata,
   // Storage
   StorageBackend,
+} from './metadata/index.js';
+
+// Deletion Vector Helpers
+export {
+  isDeletionVector,
+  validateDeletionVectorFields,
 } from './metadata/index.js';
 
 // Reader
@@ -401,6 +409,7 @@ export {
 export {
   // Format version
   FORMAT_VERSION,
+  FORMAT_VERSION_3,
   // Metadata directory
   METADATA_DIR,
   VERSION_HINT_FILENAME,
@@ -473,6 +482,42 @@ export {
 } from './errors.js';
 
 // ============================================================================
+// Deletion Vector Exports
+// ============================================================================
+
+export {
+  // Core class
+  DeletionVector,
+  // Serialization functions
+  serializeDeletionVector,
+  deserializeDeletionVector,
+  // Puffin blob helpers
+  createDeletionVectorBlob,
+  // Merge utilities
+  mergeDeletionVectors,
+  // Constants
+  DELETION_VECTOR_V1_BLOB_TYPE,
+  // Types
+  type PuffinBlob,
+} from './deletes/deletion-vector.js';
+
+// ============================================================================
+// Version Upgrade Exports
+// ============================================================================
+
+export {
+  // Upgrade functions
+  upgradeTableToV3,
+  upgradeTableToV3WithOptions,
+  canUpgradeToV3,
+  // Error handling
+  VersionUpgradeError,
+  // Types
+  type VersionUpgradeErrorCode,
+  type UpgradeOptions,
+} from './metadata/index.js';
+
+// ============================================================================
 // Utility Exports
 // ============================================================================
 
@@ -485,3 +530,114 @@ export {
   getParentPath,
   getBasename,
 } from './utils/index.js';
+
+// ============================================================================
+// Variant Shredding Exports
+// ============================================================================
+
+export type {
+  // Shredding types
+  ShreddedFieldInfo,
+  VariantColumnSchema,
+  VariantShredConfig,
+  VariantShredConfigValidationResult,
+  // Property config types
+  VariantShredPropertyConfig,
+  // Statistics path types
+  VariantFilterColumnsResult,
+  // Filter transformation types
+  TransformResult,
+  // Manifest stats types
+  ShreddedColumnStats,
+  CreateShreddedStatsOptions,
+  // Stats collection types
+  ColumnValues,
+  CollectedStats,
+  CollectedShreddedColumnStats,
+  CollectStatsOptions,
+  // Row group filter types
+  RangePredicate,
+  FilterStats,
+  // Predicate pushdown types
+  PredicateResult,
+  // ParqueDB/Hyparquet integration types
+  VariantShredConfigSimple,
+  VariantSchemaField,
+  SetupVariantShreddingOptions,
+  SetupVariantShreddingResult,
+  ConfigSchemaValidationResult,
+} from './variant/index.js';
+
+export {
+  // Shredding helper functions
+  createShreddedFieldInfo,
+  createVariantColumnSchema,
+  validateVariantShredConfig,
+  // Path generation functions
+  getMetadataPath,
+  getValuePath,
+  getTypedValuePath,
+  // Property key constants
+  VARIANT_SHRED_COLUMNS_KEY,
+  VARIANT_SHRED_FIELDS_KEY_PREFIX,
+  VARIANT_SHRED_FIELDS_KEY_SUFFIX,
+  VARIANT_FIELD_TYPES_KEY_SUFFIX,
+  // Property key generation functions
+  getShredFieldsKey,
+  getFieldTypesKey,
+  // Property parsing functions
+  parseShredColumnsProperty,
+  parseShredFieldsProperty,
+  parseFieldTypesProperty,
+  extractVariantShredConfig,
+  // Property serialization functions
+  formatShredColumnsProperty,
+  formatShredFieldsProperty,
+  formatFieldTypesProperty,
+  toTableProperties,
+  // Property validation
+  validateShredConfig,
+  // Statistics path functions
+  getStatisticsPaths,
+  getColumnForFilterPath,
+  mapFilterPathToStats,
+  isVariantFilterPath,
+  extractVariantFilterColumns,
+  // Filter transformation functions
+  transformVariantFilter,
+  isComparisonOperator,
+  isLogicalOperator,
+  // Manifest stats functions
+  getShreddedStatisticsPaths,
+  assignShreddedFieldIds,
+  serializeShreddedBound,
+  deserializeShreddedBound,
+  createShreddedColumnStats,
+  applyShreddedStatsToDataFile,
+  mergeShreddedStats,
+  // Stats collection functions
+  collectShreddedColumnStats,
+  computeStringBounds,
+  computeNumericBounds,
+  computeTimestampBounds,
+  computeBooleanBounds,
+  addShreddedStatsToDataFile,
+  // Row group filter functions
+  createRangePredicate,
+  evaluateRangePredicate,
+  combinePredicatesAnd,
+  combinePredicatesOr,
+  filterDataFiles,
+  filterDataFilesWithStats,
+  // Predicate pushdown functions
+  shouldSkipDataFile,
+  boundsOverlapValue,
+  evaluateInPredicate,
+  // ParqueDB/Hyparquet integration functions
+  parseShredConfig,
+  formatShredConfig,
+  createVariantSchemaFields,
+  getFieldIdForShreddedPath,
+  validateConfigWithSchema,
+  setupVariantShredding,
+} from './variant/index.js';

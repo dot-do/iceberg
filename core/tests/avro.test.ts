@@ -1,11 +1,18 @@
 import { describe, it, expect } from 'vitest';
 import {
   AvroEncoder,
+  AvroDecoder,
   AvroFileWriter,
   createManifestEntrySchema,
   createManifestListSchema,
   encodeStatValue,
   truncateString,
+  encodeDataFile,
+  decodeDataFile,
+  encodeManifestEntry,
+  decodeManifestEntry,
+  encodeManifestListEntry,
+  decodeManifestListEntry,
 } from '../src/avro/index.js';
 
 describe('AvroEncoder', () => {
@@ -171,6 +178,364 @@ describe('Iceberg Avro Schemas', () => {
     expect(fieldNames).toContain('manifest_path');
     expect(fieldNames).toContain('manifest_length');
     expect(fieldNames).toContain('partition_spec_id');
+  });
+});
+
+describe('Manifest Entry Schema v3 Fields', () => {
+  describe('schema structure', () => {
+    it('should include field 142 (first_row_id) as optional long in data_file', () => {
+      const schema = createManifestEntrySchema([], 0);
+      const dataFileField = schema.fields.find((f) => f.name === 'data_file');
+      expect(dataFileField).toBeDefined();
+
+      const dataFileSchema = dataFileField!.type as { fields: Array<{ name: string; type: unknown; 'field-id': number }> };
+      const firstRowIdField = dataFileSchema.fields.find((f) => f['field-id'] === 142);
+
+      expect(firstRowIdField).toBeDefined();
+      expect(firstRowIdField!.name).toBe('first_row_id');
+      expect(firstRowIdField!.type).toEqual(['null', 'long']); // optional long
+    });
+
+    it('should include field 143 (referenced_data_file) as optional string in data_file', () => {
+      const schema = createManifestEntrySchema([], 0);
+      const dataFileField = schema.fields.find((f) => f.name === 'data_file');
+      expect(dataFileField).toBeDefined();
+
+      const dataFileSchema = dataFileField!.type as { fields: Array<{ name: string; type: unknown; 'field-id': number }> };
+      const referencedDataFileField = dataFileSchema.fields.find((f) => f['field-id'] === 143);
+
+      expect(referencedDataFileField).toBeDefined();
+      expect(referencedDataFileField!.name).toBe('referenced_data_file');
+      expect(referencedDataFileField!.type).toEqual(['null', 'string']); // optional string
+    });
+
+    it('should include field 144 (content_offset) as optional long in data_file', () => {
+      const schema = createManifestEntrySchema([], 0);
+      const dataFileField = schema.fields.find((f) => f.name === 'data_file');
+      expect(dataFileField).toBeDefined();
+
+      const dataFileSchema = dataFileField!.type as { fields: Array<{ name: string; type: unknown; 'field-id': number }> };
+      const contentOffsetField = dataFileSchema.fields.find((f) => f['field-id'] === 144);
+
+      expect(contentOffsetField).toBeDefined();
+      expect(contentOffsetField!.name).toBe('content_offset');
+      expect(contentOffsetField!.type).toEqual(['null', 'long']); // optional long
+    });
+
+    it('should include field 145 (content_size_in_bytes) as optional long in data_file', () => {
+      const schema = createManifestEntrySchema([], 0);
+      const dataFileField = schema.fields.find((f) => f.name === 'data_file');
+      expect(dataFileField).toBeDefined();
+
+      const dataFileSchema = dataFileField!.type as { fields: Array<{ name: string; type: unknown; 'field-id': number }> };
+      const contentSizeField = dataFileSchema.fields.find((f) => f['field-id'] === 145);
+
+      expect(contentSizeField).toBeDefined();
+      expect(contentSizeField!.name).toBe('content_size_in_bytes');
+      expect(contentSizeField!.type).toEqual(['null', 'long']); // optional long
+    });
+  });
+
+  describe('encoding data file with v3 fields', () => {
+    it('should encode data file with first_row_id', () => {
+      // Test that encodeDataFile handles first_row_id
+      const dataFile = {
+        content: 0,
+        file_path: 's3://bucket/data.parquet',
+        file_format: 'parquet',
+        partition: {},
+        record_count: 1000,
+        file_size_in_bytes: 5000,
+        first_row_id: 42,
+      };
+
+      const encoder = new AvroEncoder();
+      encodeDataFile(encoder, dataFile, []);
+      const buffer = encoder.toBuffer();
+      expect(buffer.length).toBeGreaterThan(0);
+    });
+
+    it('should encode data file with null first_row_id', () => {
+      const dataFile = {
+        content: 0,
+        file_path: 's3://bucket/data.parquet',
+        file_format: 'parquet',
+        partition: {},
+        record_count: 1000,
+        file_size_in_bytes: 5000,
+        first_row_id: null,
+      };
+
+      const encoder = new AvroEncoder();
+      encodeDataFile(encoder, dataFile, []);
+      const buffer = encoder.toBuffer();
+      expect(buffer.length).toBeGreaterThan(0);
+    });
+
+    it('should encode data file with deletion vector fields', () => {
+      const dataFile = {
+        content: 1, // position deletes
+        file_path: 's3://bucket/dv.puffin',
+        file_format: 'parquet',
+        partition: {},
+        record_count: 100,
+        file_size_in_bytes: 1000,
+        referenced_data_file: 's3://bucket/data.parquet',
+        content_offset: 256,
+        content_size_in_bytes: 512,
+      };
+
+      const encoder = new AvroEncoder();
+      encodeDataFile(encoder, dataFile, []);
+      const buffer = encoder.toBuffer();
+      expect(buffer.length).toBeGreaterThan(0);
+    });
+
+    it('should encode manifest entry with all v3 fields', () => {
+      const dataFile = {
+        content: 1,
+        file_path: 's3://bucket/dv.puffin',
+        file_format: 'parquet',
+        partition: {},
+        record_count: 100,
+        file_size_in_bytes: 1000,
+        first_row_id: 5000,
+        referenced_data_file: 's3://bucket/data.parquet',
+        content_offset: 256,
+        content_size_in_bytes: 512,
+      };
+
+      const entry = {
+        status: 1,
+        snapshot_id: 123456789,
+        sequence_number: 1,
+        file_sequence_number: 1,
+        data_file: dataFile,
+      };
+
+      const encoder = new AvroEncoder();
+      encodeManifestEntry(encoder, entry, []);
+      const buffer = encoder.toBuffer();
+      expect(buffer.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('decoding manifest entry with v3 fields', () => {
+    it('should decode manifest entry with v3 fields', () => {
+      const dataFile = {
+        content: 1,
+        file_path: 's3://bucket/dv.puffin',
+        file_format: 'parquet',
+        partition: {},
+        record_count: 100,
+        file_size_in_bytes: 1000,
+        first_row_id: 5000,
+        referenced_data_file: 's3://bucket/data.parquet',
+        content_offset: 256,
+        content_size_in_bytes: 512,
+      };
+
+      const entry = {
+        status: 1,
+        snapshot_id: 123456789,
+        sequence_number: 1,
+        file_sequence_number: 1,
+        data_file: dataFile,
+      };
+
+      // Encode
+      const encoder = new AvroEncoder();
+      encodeManifestEntry(encoder, entry, []);
+      const buffer = encoder.toBuffer();
+
+      // Decode
+      const decoder = new AvroDecoder(buffer);
+      const decoded = decodeManifestEntry(decoder, []);
+
+      expect(decoded.status).toBe(1);
+      expect(decoded.data_file.first_row_id).toBe(5000);
+      expect(decoded.data_file.referenced_data_file).toBe('s3://bucket/data.parquet');
+      expect(decoded.data_file.content_offset).toBe(256);
+      expect(decoded.data_file.content_size_in_bytes).toBe(512);
+    });
+
+    it('should decode manifest entry without v3 fields (v2 compatibility)', () => {
+      const dataFile = {
+        content: 0,
+        file_path: 's3://bucket/data.parquet',
+        file_format: 'parquet',
+        partition: {},
+        record_count: 1000,
+        file_size_in_bytes: 5000,
+        // No v3 fields
+      };
+
+      const entry = {
+        status: 1,
+        snapshot_id: 123456789,
+        sequence_number: 1,
+        file_sequence_number: 1,
+        data_file: dataFile,
+      };
+
+      // Encode
+      const encoder = new AvroEncoder();
+      encodeManifestEntry(encoder, entry, []);
+      const buffer = encoder.toBuffer();
+
+      // Decode
+      const decoder = new AvroDecoder(buffer);
+      const decoded = decodeManifestEntry(decoder, []);
+
+      expect(decoded.status).toBe(1);
+      expect(decoded.data_file.first_row_id).toBeNull();
+      expect(decoded.data_file.referenced_data_file).toBeNull();
+      expect(decoded.data_file.content_offset).toBeNull();
+      expect(decoded.data_file.content_size_in_bytes).toBeNull();
+    });
+
+    it('should round-trip encode/decode with v3 fields', () => {
+      const originalDataFile = {
+        content: 1,
+        file_path: 's3://bucket/dv.puffin',
+        file_format: 'parquet',
+        partition: {},
+        record_count: 100,
+        file_size_in_bytes: 1000,
+        first_row_id: 9999,
+        referenced_data_file: 's3://bucket/original-data.parquet',
+        content_offset: 1024,
+        content_size_in_bytes: 2048,
+      };
+
+      const originalEntry = {
+        status: 1,
+        snapshot_id: 987654321,
+        sequence_number: 5,
+        file_sequence_number: 3,
+        data_file: originalDataFile,
+      };
+
+      // Encode
+      const encoder = new AvroEncoder();
+      encodeManifestEntry(encoder, originalEntry, []);
+      const buffer = encoder.toBuffer();
+
+      // Decode
+      const decoder = new AvroDecoder(buffer);
+      const decoded = decodeManifestEntry(decoder, []);
+
+      // Verify all fields match
+      expect(decoded.status).toBe(originalEntry.status);
+      expect(decoded.snapshot_id).toBe(originalEntry.snapshot_id);
+      expect(decoded.sequence_number).toBe(originalEntry.sequence_number);
+      expect(decoded.file_sequence_number).toBe(originalEntry.file_sequence_number);
+      expect(decoded.data_file.content).toBe(originalDataFile.content);
+      expect(decoded.data_file.file_path).toBe(originalDataFile.file_path);
+      expect(decoded.data_file.file_format).toBe(originalDataFile.file_format);
+      expect(decoded.data_file.record_count).toBe(originalDataFile.record_count);
+      expect(decoded.data_file.file_size_in_bytes).toBe(originalDataFile.file_size_in_bytes);
+      expect(decoded.data_file.first_row_id).toBe(originalDataFile.first_row_id);
+      expect(decoded.data_file.referenced_data_file).toBe(originalDataFile.referenced_data_file);
+      expect(decoded.data_file.content_offset).toBe(originalDataFile.content_offset);
+      expect(decoded.data_file.content_size_in_bytes).toBe(originalDataFile.content_size_in_bytes);
+    });
+  });
+});
+
+describe('Manifest List Schema v3 Fields', () => {
+  it('should include first_row_id field in manifest list schema', () => {
+    const schema = createManifestListSchema();
+    const firstRowIdField = schema.fields.find((f) => f.name === 'first_row_id');
+
+    expect(firstRowIdField).toBeDefined();
+    expect(firstRowIdField!['field-id']).toBe(519);
+    expect(firstRowIdField!.type).toEqual(['null', 'long']); // optional long
+  });
+
+  it('should encode manifest list entry with first_row_id', () => {
+    const manifestFile = {
+      manifest_path: 's3://bucket/manifest.avro',
+      manifest_length: 1024,
+      partition_spec_id: 0,
+      content: 0,
+      sequence_number: 1,
+      min_sequence_number: 1,
+      added_snapshot_id: 123456789,
+      added_files_count: 5,
+      existing_files_count: 0,
+      deleted_files_count: 0,
+      added_rows_count: 1000,
+      existing_rows_count: 0,
+      deleted_rows_count: 0,
+      first_row_id: 5000,
+    };
+
+    const encoder = new AvroEncoder();
+    encodeManifestListEntry(encoder, manifestFile);
+    const buffer = encoder.toBuffer();
+    expect(buffer.length).toBeGreaterThan(0);
+  });
+
+  it('should decode manifest list entry with first_row_id', () => {
+    const manifestFile = {
+      manifest_path: 's3://bucket/manifest.avro',
+      manifest_length: 1024,
+      partition_spec_id: 0,
+      content: 0,
+      sequence_number: 1,
+      min_sequence_number: 1,
+      added_snapshot_id: 123456789,
+      added_files_count: 5,
+      existing_files_count: 0,
+      deleted_files_count: 0,
+      added_rows_count: 1000,
+      existing_rows_count: 0,
+      deleted_rows_count: 0,
+      first_row_id: 5000,
+    };
+
+    // Encode
+    const encoder = new AvroEncoder();
+    encodeManifestListEntry(encoder, manifestFile);
+    const buffer = encoder.toBuffer();
+
+    // Decode
+    const decoder = new AvroDecoder(buffer);
+    const decoded = decodeManifestListEntry(decoder);
+
+    expect(decoded.manifest_path).toBe(manifestFile.manifest_path);
+    expect(decoded.first_row_id).toBe(5000);
+  });
+
+  it('should handle null first_row_id in manifest list entry', () => {
+    const manifestFile = {
+      manifest_path: 's3://bucket/manifest.avro',
+      manifest_length: 1024,
+      partition_spec_id: 0,
+      content: 0,
+      sequence_number: 1,
+      min_sequence_number: 1,
+      added_snapshot_id: 123456789,
+      added_files_count: 5,
+      existing_files_count: 0,
+      deleted_files_count: 0,
+      added_rows_count: 1000,
+      existing_rows_count: 0,
+      deleted_rows_count: 0,
+      first_row_id: null,
+    };
+
+    // Encode
+    const encoder = new AvroEncoder();
+    encodeManifestListEntry(encoder, manifestFile);
+    const buffer = encoder.toBuffer();
+
+    // Decode
+    const decoder = new AvroDecoder(buffer);
+    const decoded = decodeManifestListEntry(decoder);
+
+    expect(decoded.first_row_id).toBeNull();
   });
 });
 

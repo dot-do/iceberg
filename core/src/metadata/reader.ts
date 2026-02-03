@@ -13,6 +13,7 @@ import type {
 } from './types.js';
 import {
   FORMAT_VERSION,
+  FORMAT_VERSION_3,
   METADATA_DIR,
   VERSION_HINT_FILENAME,
 } from './constants.js';
@@ -144,8 +145,8 @@ export function parseTableMetadata(json: string): TableMetadata {
 
   const metadata = parsed as Record<string, unknown>;
 
-  // Validate required fields
-  if (metadata['format-version'] !== FORMAT_VERSION) {
+  // Validate required fields - support both v2 and v3 format versions
+  if (metadata['format-version'] !== FORMAT_VERSION && metadata['format-version'] !== FORMAT_VERSION_3) {
     throw new Error(`Unsupported format version: ${metadata['format-version']}`);
   }
 

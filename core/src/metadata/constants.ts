@@ -14,8 +14,15 @@
 /**
  * The Iceberg format version supported by this implementation.
  * This implementation supports Iceberg v2 format.
+ * Default to v2 for backward compatibility.
  */
 export const FORMAT_VERSION = 2;
+
+/**
+ * Iceberg format version 3.
+ * v3 adds additional features while maintaining backward compatibility with v2.
+ */
+export const FORMAT_VERSION_3 = 3;
 
 // ============================================================================
 // Metadata Directory

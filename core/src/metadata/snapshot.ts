@@ -17,6 +17,7 @@ import type {
   ManifestFile,
   TableMetadata,
   Snapshot,
+  EncryptionKey,
 } from './types.js';
 import {
   createDefaultSchema,
@@ -46,6 +47,12 @@ export interface CreateTableOptions {
   partitionSpec?: PartitionSpec;
   sortOrder?: SortOrder;
   properties?: Record<string, string>;
+  /** Format version (2 or 3). Defaults to 2 for backward compatibility. */
+  formatVersion?: 2 | 3;
+  /** Initial next-row-id value (v3 only). Defaults to 0 for v3 tables. */
+  nextRowId?: number;
+  /** Optional encryption keys for table encryption. */
+  encryptionKeys?: EncryptionKey[];
 }
 
 /** Snapshot retention policy configuration */
@@ -122,6 +129,10 @@ export class SnapshotBuilder {
   private manifestListPath: string;
   private schemaId: number;
   private summaryStats: SnapshotSummary;
+  private formatVersion: 2 | 3;
+  private firstRowId?: number;
+  private addedRows?: number;
+  private keyId?: number;
 
   constructor(options: {
     sequenceNumber: number;
@@ -131,6 +142,14 @@ export class SnapshotBuilder {
     operation?: 'append' | 'replace' | 'overwrite' | 'delete';
     manifestListPath: string;
     schemaId?: number;
+    /** Format version (2 or 3). Defaults to 2 for backward compatibility. */
+    formatVersion?: 2 | 3;
+    /** First row ID for v3 snapshots (required for v3, optional for v2). */
+    firstRowId?: number;
+    /** Number of rows added by this snapshot (required for v3, optional for v2). */
+    addedRows?: number;
+    /** ID of the encryption key that encrypts the manifest list key metadata. */
+    keyId?: number;
   }) {
     // Validate sequenceNumber is a non-negative integer
     if (!Number.isInteger(options.sequenceNumber) || options.sequenceNumber < 0) {
@@ -152,6 +171,10 @@ export class SnapshotBuilder {
     this.summaryStats = {
       operation: this.operation,
     };
+    this.formatVersion = options.formatVersion ?? FORMAT_VERSION;
+    this.firstRowId = options.firstRowId;
+    this.addedRows = options.addedRows;
+    this.keyId = options.keyId;
   }
 
   /**
@@ -195,26 +218,29 @@ export class SnapshotBuilder {
    * Build the snapshot object.
    */
   build(): Snapshot {
-    if (this.parentSnapshotId !== undefined) {
-      return {
-        'snapshot-id': this.snapshotId,
-        'parent-snapshot-id': this.parentSnapshotId,
-        'sequence-number': this.sequenceNumber,
-        'timestamp-ms': this.timestampMs,
-        'manifest-list': this.manifestListPath,
-        summary: this.summaryStats,
-        'schema-id': this.schemaId,
-      };
-    }
-
-    return {
+    // Build base snapshot fields
+    const baseSnapshot: Snapshot = {
       'snapshot-id': this.snapshotId,
+      ...(this.parentSnapshotId !== undefined && { 'parent-snapshot-id': this.parentSnapshotId }),
       'sequence-number': this.sequenceNumber,
       'timestamp-ms': this.timestampMs,
       'manifest-list': this.manifestListPath,
       summary: this.summaryStats,
       'schema-id': this.schemaId,
+      // Add key-id for encryption if provided
+      ...(this.keyId !== undefined && { 'key-id': this.keyId }),
     };
+
+    // Add v3 row lineage fields if format version is 3
+    if (this.formatVersion === 3) {
+      return {
+        ...baseSnapshot,
+        'first-row-id': this.firstRowId ?? 0,
+        'added-rows': this.addedRows ?? 0,
+      };
+    }
+
+    return baseSnapshot;
   }
 
   /**
@@ -249,12 +275,14 @@ export class TableMetadataBuilder {
     const schema = options.schema ?? createDefaultSchema();
     const partitionSpec = options.partitionSpec ?? createUnpartitionedSpec();
     const sortOrder = options.sortOrder ?? createUnsortedOrder();
+    const formatVersion = options.formatVersion ?? FORMAT_VERSION;
 
     // Find the highest field ID in the schema
     const lastColumnId = this.findMaxFieldId(schema);
 
-    this.metadata = {
-      'format-version': FORMAT_VERSION,
+    // Build base metadata
+    const baseMetadata = {
+      'format-version': formatVersion as 2 | 3,
       'table-uuid': options.tableUuid ?? generateUUID(),
       location: options.location,
       'last-sequence-number': 0,
@@ -273,17 +301,75 @@ export class TableMetadataBuilder {
       'snapshot-log': [],
       'metadata-log': [],
       refs: {},
+      // Add encryption keys if provided
+      ...(options.encryptionKeys && options.encryptionKeys.length > 0
+        ? { 'encryption-keys': options.encryptionKeys }
+        : {}),
     };
+
+    // Add next-row-id for v3 tables (required for row lineage)
+    if (formatVersion === 3) {
+      this.metadata = {
+        ...baseMetadata,
+        'next-row-id': options.nextRowId ?? 0,
+      } as TableMetadata;
+    } else {
+      this.metadata = baseMetadata as TableMetadata;
+    }
   }
 
   /**
-   * Create a builder from existing metadata.
+   * Options for creating a builder from existing metadata.
    */
-  static fromMetadata(metadata: TableMetadata): TableMetadataBuilder {
+  static fromMetadataOptions?: {
+    /**
+     * Upgrade the table to a new format version.
+     * If specified and different from the current version, performs an upgrade.
+     */
+    formatVersion?: 2 | 3;
+  };
+
+  /**
+   * Create a builder from existing metadata.
+   *
+   * @param metadata - The existing table metadata
+   * @param options - Optional settings for the builder, including format version upgrade
+   * @returns A new TableMetadataBuilder
+   *
+   * @example
+   * ```ts
+   * // Simple copy
+   * const builder = TableMetadataBuilder.fromMetadata(existingMetadata);
+   *
+   * // Upgrade from v2 to v3
+   * const builder = TableMetadataBuilder.fromMetadata(v2Metadata, { formatVersion: 3 });
+   * ```
+   */
+  static fromMetadata(
+    metadata: TableMetadata,
+    options?: { formatVersion?: 2 | 3 }
+  ): TableMetadataBuilder {
     const builder = new TableMetadataBuilder({
       location: metadata.location,
     });
-    builder.metadata = { ...metadata };
+
+    // Check if upgrading format version
+    const targetVersion = options?.formatVersion ?? metadata['format-version'];
+    const isUpgrading = targetVersion > metadata['format-version'];
+
+    if (isUpgrading && targetVersion === 3 && metadata['format-version'] === 2) {
+      // Perform v2 to v3 upgrade
+      builder.metadata = {
+        ...metadata,
+        'format-version': 3,
+        'last-updated-ms': Date.now(),
+        'next-row-id': 0, // Initialize row lineage tracking
+      } as TableMetadata;
+    } else {
+      // Normal copy
+      builder.metadata = { ...metadata };
+    }
+
     return builder;
   }
 
@@ -338,7 +424,7 @@ export class TableMetadataBuilder {
    * Add a new snapshot to the table.
    */
   addSnapshot(snapshot: Snapshot): this {
-    this.metadata = {
+    const baseUpdate = {
       ...this.metadata,
       snapshots: [...this.metadata.snapshots, snapshot],
       'current-snapshot-id': snapshot['snapshot-id'],
@@ -365,6 +451,17 @@ export class TableMetadataBuilder {
         },
       },
     };
+
+    // Update next-row-id for v3 tables when row lineage info is present
+    if (this.metadata['format-version'] === 3 && typeof snapshot['added-rows'] === 'number') {
+      const currentNextRowId = this.metadata['next-row-id'] ?? 0;
+      this.metadata = {
+        ...baseUpdate,
+        'next-row-id': currentNextRowId + snapshot['added-rows'],
+      } as TableMetadata;
+    } else {
+      this.metadata = baseUpdate as TableMetadata;
+    }
 
     return this;
   }
@@ -459,6 +556,18 @@ export class TableMetadataBuilder {
     this.metadata = {
       ...this.metadata,
       properties: remainingProperties,
+    };
+    return this;
+  }
+
+  /**
+   * Add an encryption key to the table.
+   */
+  addEncryptionKey(key: EncryptionKey): this {
+    const existingKeys = this.metadata['encryption-keys'] ?? [];
+    this.metadata = {
+      ...this.metadata,
+      'encryption-keys': [...existingKeys, key],
     };
     return this;
   }

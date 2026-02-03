@@ -729,9 +729,27 @@ export function getPartitionData(
 
   // Apply transforms for each partition field
   for (const partitionField of spec.fields) {
-    const sourceFieldName = fieldIdToName.get(partitionField['source-id']);
+    // Handle single-source transforms (source-id) vs multi-source transforms (source-ids)
+    const sourceId = partitionField['source-id'];
+    const sourceIds = partitionField['source-ids'];
+
+    if (sourceIds !== undefined && sourceIds.length > 0) {
+      // Multi-argument transforms are not yet supported for partition data extraction
+      throw new Error(
+        `Multi-argument transforms (source-ids) are not yet supported for partition data extraction. ` +
+          `Field '${partitionField.name}' has source-ids: [${sourceIds.join(', ')}]`
+      );
+    }
+
+    if (sourceId === undefined) {
+      throw new Error(
+        `Partition field '${partitionField.name}' must have either 'source-id' or 'source-ids'`
+      );
+    }
+
+    const sourceFieldName = fieldIdToName.get(sourceId);
     if (!sourceFieldName) {
-      throw new Error(`Source field ID ${partitionField['source-id']} not found in schema`);
+      throw new Error(`Source field ID ${sourceId} not found in schema`);
     }
 
     const sourceValue = record[sourceFieldName];

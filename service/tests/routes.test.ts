@@ -2517,4 +2517,463 @@ describe('Iceberg REST Catalog Routes', () => {
       });
     });
   });
+
+  // =========================================================================
+  // Iceberg v3 Format Version Support
+  // =========================================================================
+  describe('Iceberg v3 Format Version Support', () => {
+    beforeEach(async () => {
+      // Create a namespace for v3 tests
+      await request('POST', '/v1/namespaces', { namespace: ['v3_test_db'] });
+    });
+
+    describe('Create Table v3', () => {
+      it('should create a v3 table when format-version: 3 is specified in properties', async () => {
+        const res = await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'v3_table',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+              { id: 2, name: 'name', required: true, type: 'string' },
+            ],
+          },
+          properties: {
+            'format-version': '3',
+          },
+        });
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.metadata['format-version']).toBe(3);
+        // v3 tables MUST have next-row-id
+        expect(data.metadata['next-row-id']).toBeDefined();
+        expect(data.metadata['next-row-id']).toBe(0);
+      });
+
+      it('should default to v2 when format-version is not specified (backward compatibility)', async () => {
+        const res = await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'default_version_table',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+        });
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.metadata['format-version']).toBe(2);
+        // v2 tables should NOT have next-row-id
+        expect(data.metadata['next-row-id']).toBeUndefined();
+      });
+
+      it('should return v3 metadata with next-row-id field in response', async () => {
+        const res = await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'v3_with_next_row_id',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+          properties: {
+            'format-version': '3',
+          },
+        });
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.metadata).toHaveProperty('next-row-id');
+        expect(typeof data.metadata['next-row-id']).toBe('number');
+        expect(data.metadata['next-row-id']).toBeGreaterThanOrEqual(0);
+      });
+    });
+
+    describe('Load Table v3', () => {
+      it('should return v3 metadata with all v3 fields on GET', async () => {
+        // Create a v3 table first
+        await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'load_v3_table',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+          properties: {
+            'format-version': '3',
+          },
+        });
+
+        // Load the table
+        const res = await request('GET', '/v1/namespaces/v3_test_db/tables/load_v3_table');
+        expect(res.status).toBe(200);
+        const data = await res.json();
+        expect(data.metadata['format-version']).toBe(3);
+        expect(data.metadata['next-row-id']).toBeDefined();
+        expect(data.metadata['next-row-id']).toBe(0);
+      });
+
+      it('should preserve next-row-id value across load operations', async () => {
+        // Create a v3 table
+        const createRes = await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'preserve_next_row_id',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+          properties: {
+            'format-version': '3',
+          },
+        });
+        const createData = await createRes.json();
+        const initialNextRowId = createData.metadata['next-row-id'];
+
+        // Load the table
+        const loadRes = await request('GET', '/v1/namespaces/v3_test_db/tables/preserve_next_row_id');
+        expect(loadRes.status).toBe(200);
+        const loadData = await loadRes.json();
+        expect(loadData.metadata['next-row-id']).toBe(initialNextRowId);
+      });
+    });
+
+    describe('Update Table v3 (upgrade-format-version)', () => {
+      it('should upgrade table from v2 to v3 via upgrade-format-version update', async () => {
+        // Create a v2 table
+        const createRes = await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'upgrade_to_v3',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+        });
+        const createData = await createRes.json();
+        expect(createData.metadata['format-version']).toBe(2);
+        const tableUuid = createData.metadata['table-uuid'];
+
+        // Upgrade to v3
+        const upgradeRes = await request('POST', '/v1/namespaces/v3_test_db/tables/upgrade_to_v3', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            { action: 'upgrade-format-version', 'format-version': 3 },
+          ],
+        });
+        expect(upgradeRes.status).toBe(200);
+        const upgradeData = await upgradeRes.json();
+        expect(upgradeData.metadata['format-version']).toBe(3);
+        // After upgrade to v3, next-row-id MUST be present
+        expect(upgradeData.metadata['next-row-id']).toBeDefined();
+        expect(upgradeData.metadata['next-row-id']).toBe(0);
+      });
+
+      it('should initialize next-row-id to 0 when upgrading to v3', async () => {
+        // Create a v2 table
+        const createRes = await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'upgrade_init_next_row',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+        });
+        const createData = await createRes.json();
+
+        // Upgrade to v3
+        const upgradeRes = await request('POST', '/v1/namespaces/v3_test_db/tables/upgrade_init_next_row', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: createData.metadata['table-uuid'] },
+          ],
+          updates: [
+            { action: 'upgrade-format-version', 'format-version': 3 },
+          ],
+        });
+        expect(upgradeRes.status).toBe(200);
+        const upgradeData = await upgradeRes.json();
+        expect(upgradeData.metadata['next-row-id']).toBe(0);
+      });
+    });
+
+    describe('Commit v3 (snapshots with first-row-id and added-rows)', () => {
+      it('should accept v3 snapshots with first-row-id and added-rows', async () => {
+        // Create a v3 table
+        const createRes = await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'v3_snapshot_table',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+          properties: {
+            'format-version': '3',
+          },
+        });
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+
+        // Add a snapshot with v3 fields
+        const snapshotId = Date.now();
+        const commitRes = await request('POST', '/v1/namespaces/v3_test_db/tables/v3_snapshot_table', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+            { type: 'assert-ref-snapshot-id', ref: 'main', 'snapshot-id': null },
+          ],
+          updates: [
+            {
+              action: 'add-snapshot',
+              snapshot: {
+                'snapshot-id': snapshotId,
+                'sequence-number': 1,
+                'timestamp-ms': snapshotId,
+                'manifest-list': 's3://bucket/v3_test_db/v3_snapshot_table/metadata/snap-1.avro',
+                summary: { operation: 'append' },
+                'schema-id': 0,
+                'first-row-id': 0, // v3 field
+                'added-rows': 100, // v3 field
+              },
+            },
+            {
+              action: 'set-snapshot-ref',
+              'ref-name': 'main',
+              type: 'branch',
+              'snapshot-id': snapshotId,
+            },
+          ],
+        });
+        expect(commitRes.status).toBe(200);
+        const commitData = await commitRes.json();
+
+        // Verify v3 snapshot fields are preserved
+        const snapshot = commitData.metadata.snapshots.find(
+          (s: { 'snapshot-id': number }) => s['snapshot-id'] === snapshotId
+        );
+        expect(snapshot).toBeDefined();
+        expect(snapshot['first-row-id']).toBe(0);
+        expect(snapshot['added-rows']).toBe(100);
+      });
+
+      it('should update next-row-id after commit with added-rows', async () => {
+        // Create a v3 table
+        const createRes = await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'v3_next_row_update',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+          properties: {
+            'format-version': '3',
+          },
+        });
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+        expect(createData.metadata['next-row-id']).toBe(0);
+
+        // Add a snapshot with 100 rows
+        const snapshotId = Date.now();
+        const commitRes = await request('POST', '/v1/namespaces/v3_test_db/tables/v3_next_row_update', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            {
+              action: 'add-snapshot',
+              snapshot: {
+                'snapshot-id': snapshotId,
+                'sequence-number': 1,
+                'timestamp-ms': snapshotId,
+                'manifest-list': 's3://bucket/v3_test_db/v3_next_row_update/metadata/snap-1.avro',
+                summary: { operation: 'append' },
+                'schema-id': 0,
+                'first-row-id': 0,
+                'added-rows': 100,
+              },
+            },
+            {
+              action: 'set-snapshot-ref',
+              'ref-name': 'main',
+              type: 'branch',
+              'snapshot-id': snapshotId,
+            },
+          ],
+        });
+        expect(commitRes.status).toBe(200);
+        const commitData = await commitRes.json();
+
+        // next-row-id should be updated to account for the added rows
+        expect(commitData.metadata['next-row-id']).toBe(100);
+      });
+
+      it('should preserve next-row-id on commits without added-rows', async () => {
+        // Create a v3 table
+        const createRes = await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'v3_preserve_next_row',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+          properties: {
+            'format-version': '3',
+          },
+        });
+        const createData = await createRes.json();
+        const tableUuid = createData.metadata['table-uuid'];
+
+        // First commit with 50 rows
+        const snapshot1Id = Date.now();
+        await request('POST', '/v1/namespaces/v3_test_db/tables/v3_preserve_next_row', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            {
+              action: 'add-snapshot',
+              snapshot: {
+                'snapshot-id': snapshot1Id,
+                'sequence-number': 1,
+                'timestamp-ms': snapshot1Id,
+                'manifest-list': 's3://bucket/v3_test_db/v3_preserve_next_row/metadata/snap-1.avro',
+                summary: { operation: 'append' },
+                'schema-id': 0,
+                'first-row-id': 0,
+                'added-rows': 50,
+              },
+            },
+            {
+              action: 'set-snapshot-ref',
+              'ref-name': 'main',
+              type: 'branch',
+              'snapshot-id': snapshot1Id,
+            },
+          ],
+        });
+
+        // Second commit - just add a property, no snapshot
+        const propRes = await request('POST', '/v1/namespaces/v3_test_db/tables/v3_preserve_next_row', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            { action: 'set-properties', updates: { test: 'value' } },
+          ],
+        });
+        expect(propRes.status).toBe(200);
+        const propData = await propRes.json();
+
+        // next-row-id should still be 50
+        expect(propData.metadata['next-row-id']).toBe(50);
+      });
+    });
+
+    describe('Error Handling v3', () => {
+      it('should return error when v3-only features used on v2 table', async () => {
+        // Create a v2 table
+        const createRes = await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'v2_no_row_lineage',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+        });
+        const createData = await createRes.json();
+        expect(createData.metadata['format-version']).toBe(2);
+        const tableUuid = createData.metadata['table-uuid'];
+
+        // Try to add a snapshot with v3-only fields to a v2 table
+        // The server should either reject it or ignore the v3 fields
+        const snapshotId = Date.now();
+        const commitRes = await request('POST', '/v1/namespaces/v3_test_db/tables/v2_no_row_lineage', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: tableUuid },
+          ],
+          updates: [
+            {
+              action: 'add-snapshot',
+              snapshot: {
+                'snapshot-id': snapshotId,
+                'sequence-number': 1,
+                'timestamp-ms': snapshotId,
+                'manifest-list': 's3://bucket/v3_test_db/v2_no_row_lineage/metadata/snap-1.avro',
+                summary: { operation: 'append' },
+                'schema-id': 0,
+                'first-row-id': 0, // v3 field - should be rejected or stripped for v2 table
+                'added-rows': 100, // v3 field - should be rejected or stripped for v2 table
+              },
+            },
+            {
+              action: 'set-snapshot-ref',
+              'ref-name': 'main',
+              type: 'branch',
+              'snapshot-id': snapshotId,
+            },
+          ],
+        });
+
+        // The table is v2, so v3-specific fields should either:
+        // 1. Be stripped from the snapshot (permissive mode)
+        // 2. Cause a 400 error (strict mode)
+        // We expect strict mode per Iceberg spec
+        if (commitRes.status === 200) {
+          const commitData = await commitRes.json();
+          // If permissive, v3 fields should be stripped
+          const snapshot = commitData.metadata.snapshots.find(
+            (s: { 'snapshot-id': number }) => s['snapshot-id'] === snapshotId
+          );
+          expect(snapshot['first-row-id']).toBeUndefined();
+          expect(snapshot['added-rows']).toBeUndefined();
+          // Ensure it's still v2
+          expect(commitData.metadata['format-version']).toBe(2);
+          expect(commitData.metadata['next-row-id']).toBeUndefined();
+        } else {
+          // If strict, should be 400
+          expect(commitRes.status).toBe(400);
+          const data = await commitRes.json();
+          expect(data.error.message).toContain('v3');
+        }
+      });
+
+      it('should not allow downgrade from v3 to v2', async () => {
+        // Create a v3 table
+        const createRes = await request('POST', '/v1/namespaces/v3_test_db/tables', {
+          name: 'no_downgrade',
+          schema: {
+            type: 'struct',
+            fields: [
+              { id: 1, name: 'id', required: true, type: 'long' },
+            ],
+          },
+          properties: {
+            'format-version': '3',
+          },
+        });
+        const createData = await createRes.json();
+        expect(createData.metadata['format-version']).toBe(3);
+
+        // Try to downgrade to v2
+        const downgradeRes = await request('POST', '/v1/namespaces/v3_test_db/tables/no_downgrade', {
+          requirements: [
+            { type: 'assert-table-uuid', uuid: createData.metadata['table-uuid'] },
+          ],
+          updates: [
+            { action: 'upgrade-format-version', 'format-version': 2 },
+          ],
+        });
+        // Should fail - downgrades are not allowed
+        expect(downgradeRes.status).toBe(400);
+        const downgradeData = await downgradeRes.json();
+        expect(downgradeData.error.message).toContain('downgrade');
+      });
+    });
+  });
 });

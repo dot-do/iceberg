@@ -630,7 +630,7 @@ describe('validateMetadata', () => {
     } as unknown as TableMetadata;
 
     expect(() => writer.validateMetadata(invalidMetadata)).toThrow(
-      'Invalid format-version: expected 2, got 1'
+      'Invalid format-version: expected 2 or 3, got 1'
     );
   });
 

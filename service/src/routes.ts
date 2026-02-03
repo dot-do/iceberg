@@ -240,6 +240,10 @@ interface Snapshot {
   'manifest-list': string;
   summary: Record<string, string>;
   'schema-id'?: number;
+  /** First row ID assigned to rows added by this snapshot (v3 only). */
+  'first-row-id'?: number;
+  /** Total number of rows added by this snapshot (v3 only). */
+  'added-rows'?: number;
 }
 
 interface TableMetadata {
@@ -262,6 +266,8 @@ interface TableMetadata {
   'snapshot-log'?: Array<{ 'timestamp-ms': number; 'snapshot-id': number }>;
   'metadata-log'?: Array<{ 'timestamp-ms': number; 'metadata-file': string }>;
   refs?: Record<string, { 'snapshot-id': number; type: 'branch' | 'tag' }>;
+  /** Next row ID to be assigned (v3 only). Required for format-version 3, must be non-negative. */
+  'next-row-id'?: number;
 }
 
 // ============================================================================
@@ -861,15 +867,17 @@ function createDefaultMetadata(
   }
 
   // Determine format version from properties (default to 2)
-  let formatVersion = 2;
+  // Supports v1, v2, and v3 (Iceberg spec)
+  let formatVersion: 1 | 2 | 3 = 2;
   if (properties?.['format-version']) {
     const requested = parseInt(properties['format-version'], 10);
-    if (!isNaN(requested) && requested >= 1 && requested <= 2) {
-      formatVersion = requested;
+    if (!isNaN(requested) && requested >= 1 && requested <= 3) {
+      formatVersion = requested as 1 | 2 | 3;
     }
   }
 
-  return {
+  // Build base metadata
+  const metadata: TableMetadata = {
     'format-version': formatVersion,
     'table-uuid': tableUuid,
     location,
@@ -892,6 +900,13 @@ function createDefaultMetadata(
     'metadata-log': [],
     refs: {},
   };
+
+  // v3 tables require next-row-id (initialized to 0)
+  if (formatVersion === 3) {
+    (metadata as TableMetadata)['next-row-id'] = 0;
+  }
+
+  return metadata;
 }
 
 /**
@@ -988,9 +1003,23 @@ function applyUpdates(
         result['table-uuid'] = update.uuid;
         break;
 
-      case 'upgrade-format-version':
-        result['format-version'] = update['format-version'];
+      case 'upgrade-format-version': {
+        const newVersion = update['format-version'];
+        const currentVersion = result['format-version'];
+
+        // Prevent downgrade (e.g., v3 -> v2)
+        if (newVersion < currentVersion) {
+          throw new Error(`Cannot downgrade format version from ${currentVersion} to ${newVersion}`);
+        }
+
+        result['format-version'] = newVersion;
+
+        // When upgrading to v3, initialize next-row-id if not present
+        if (newVersion === 3 && result['next-row-id'] === undefined) {
+          result['next-row-id'] = 0;
+        }
         break;
+      }
 
       case 'add-schema': {
         // Ensure schema-id is a valid non-negative integer
@@ -1137,6 +1166,27 @@ function applyUpdates(
 
       case 'add-snapshot': {
         const snapshot = update.snapshot;
+
+        // For v3 tables, handle row lineage
+        if (result['format-version'] === 3) {
+          // Update next-row-id if snapshot has added-rows
+          if (typeof snapshot['added-rows'] === 'number' && snapshot['added-rows'] > 0) {
+            const currentNextRowId = result['next-row-id'] ?? 0;
+            result['next-row-id'] = currentNextRowId + snapshot['added-rows'];
+          }
+        } else {
+          // For v2 tables, strip v3-only fields from snapshot
+          const { 'first-row-id': _, 'added-rows': __, ...v2Snapshot } = snapshot;
+          result.snapshots = [...(result.snapshots ?? []), v2Snapshot as Snapshot];
+          result['snapshot-log'] = [
+            ...(result['snapshot-log'] ?? []),
+            { 'timestamp-ms': v2Snapshot['timestamp-ms'], 'snapshot-id': v2Snapshot['snapshot-id'] },
+          ];
+          result['current-snapshot-id'] = v2Snapshot['snapshot-id'];
+          result['last-sequence-number'] = v2Snapshot['sequence-number'];
+          break;
+        }
+
         result.snapshots = [...(result.snapshots ?? []), snapshot];
         result['snapshot-log'] = [
           ...(result['snapshot-log'] ?? []),
@@ -2448,6 +2498,19 @@ export function createIcebergRoutes(): Hono<{ Bindings: Env; Variables: ContextV
           metadata: newMetadata,
         });
       } catch (error) {
+        // Check if this is a format version downgrade error
+        // (format version downgrades are a client error, not a server error)
+        if (error instanceof Error) {
+          const message = error.message.toLowerCase();
+          if (message.includes('downgrade') && message.includes('format version')) {
+            return icebergError(
+              c,
+              error.message,
+              'BadRequestException',
+              400
+            );
+          }
+        }
         // Don't retry on non-conflict errors
         return icebergError(
           c,

@@ -458,6 +458,39 @@ export function createManifestEntrySchema(
         default: null,
         'field-id': 140,
       },
+      // v3 fields
+      // First row ID (v3 row lineage)
+      {
+        name: 'first_row_id',
+        type: ['null', 'long'] as AvroUnion,
+        default: null,
+        'field-id': 142,
+        doc: 'First row ID assigned to rows in this data file (v3)',
+      },
+      // Referenced data file (v3 deletion vectors)
+      {
+        name: 'referenced_data_file',
+        type: ['null', 'string'] as AvroUnion,
+        default: null,
+        'field-id': 143,
+        doc: 'Path to referenced data file for deletion vectors (v3)',
+      },
+      // Content offset (v3 deletion vectors)
+      {
+        name: 'content_offset',
+        type: ['null', 'long'] as AvroUnion,
+        default: null,
+        'field-id': 144,
+        doc: 'Byte offset in Puffin file for deletion vector blob (v3)',
+      },
+      // Content size in bytes (v3 deletion vectors)
+      {
+        name: 'content_size_in_bytes',
+        type: ['null', 'long'] as AvroUnion,
+        default: null,
+        'field-id': 145,
+        doc: 'Size of deletion vector blob in bytes (v3)',
+      },
     ],
   };
 
@@ -511,6 +544,14 @@ export function createManifestListSchema(): AvroRecord {
         }}] as AvroUnion,
         default: null,
         'field-id': 507,
+      },
+      // First row ID (v3 row lineage)
+      {
+        name: 'first_row_id',
+        type: ['null', 'long'] as AvroUnion,
+        default: null,
+        'field-id': 519,
+        doc: 'First row ID assigned to data files in this manifest (v3)',
       },
     ],
   };
@@ -584,4 +625,809 @@ export function truncateString(value: string, length: number = 16): string {
     return value;
   }
   return value.slice(0, length);
+}
+
+// ============================================================================
+// Avro Binary Decoder
+// ============================================================================
+
+/**
+ * Avro binary decoder.
+ * Decodes values according to the Avro binary encoding specification.
+ */
+export class AvroDecoder {
+  private buffer: Uint8Array;
+  private pos: number = 0;
+
+  constructor(buffer: Uint8Array) {
+    this.buffer = buffer;
+  }
+
+  /**
+   * Read a null value (no bytes read).
+   */
+  readNull(): null {
+    return null;
+  }
+
+  /**
+   * Read a boolean value.
+   */
+  readBoolean(): boolean {
+    return this.buffer[this.pos++] !== 0;
+  }
+
+  /**
+   * Read an int (32-bit signed) using variable-length zig-zag encoding.
+   */
+  readInt(): number {
+    const n = this.readVarInt();
+    return this.zigZagDecode32(n);
+  }
+
+  /**
+   * Read a long (64-bit signed) using variable-length zig-zag encoding.
+   */
+  readLong(): number {
+    const n = this.readVarLong();
+    return Number(this.zigZagDecode64(n));
+  }
+
+  /**
+   * Read a float (32-bit IEEE 754).
+   */
+  readFloat(): number {
+    const view = new DataView(this.buffer.buffer, this.buffer.byteOffset + this.pos, 4);
+    this.pos += 4;
+    return view.getFloat32(0, true); // little-endian
+  }
+
+  /**
+   * Read a double (64-bit IEEE 754).
+   */
+  readDouble(): number {
+    const view = new DataView(this.buffer.buffer, this.buffer.byteOffset + this.pos, 8);
+    this.pos += 8;
+    return view.getFloat64(0, true); // little-endian
+  }
+
+  /**
+   * Read bytes (length-prefixed).
+   */
+  readBytes(): Uint8Array {
+    const length = this.readLong();
+    const bytes = this.buffer.slice(this.pos, this.pos + length);
+    this.pos += length;
+    return bytes;
+  }
+
+  /**
+   * Read a string (UTF-8 encoded, length-prefixed).
+   */
+  readString(): string {
+    const bytes = this.readBytes();
+    return new TextDecoder().decode(bytes);
+  }
+
+  /**
+   * Read a fixed-length byte array.
+   */
+  readFixed(size: number): Uint8Array {
+    const bytes = this.buffer.slice(this.pos, this.pos + size);
+    this.pos += size;
+    return bytes;
+  }
+
+  /**
+   * Read an enum value (as its ordinal index).
+   */
+  readEnum(): number {
+    return this.readInt();
+  }
+
+  /**
+   * Read the union index for a union type.
+   */
+  readUnionIndex(): number {
+    return this.readLong();
+  }
+
+  /**
+   * Read an array of values.
+   */
+  readArray<T>(readElement: () => T): T[] {
+    const result: T[] = [];
+    let blockCount = this.readLong();
+    while (blockCount !== 0) {
+      if (blockCount < 0) {
+        // Negative count means block has size prefix (skip it)
+        blockCount = -blockCount;
+        this.readLong(); // skip block size
+      }
+      for (let i = 0; i < blockCount; i++) {
+        result.push(readElement());
+      }
+      blockCount = this.readLong();
+    }
+    return result;
+  }
+
+  /**
+   * Read a map of key-value pairs.
+   */
+  readMap<V>(readValue: () => V): Map<string, V> {
+    const result = new Map<string, V>();
+    let blockCount = this.readLong();
+    while (blockCount !== 0) {
+      if (blockCount < 0) {
+        blockCount = -blockCount;
+        this.readLong(); // skip block size
+      }
+      for (let i = 0; i < blockCount; i++) {
+        const key = this.readString();
+        const value = readValue();
+        result.set(key, value);
+      }
+      blockCount = this.readLong();
+    }
+    return result;
+  }
+
+  /**
+   * Get current position in buffer.
+   */
+  get position(): number {
+    return this.pos;
+  }
+
+  /**
+   * Check if there are more bytes to read.
+   */
+  hasMore(): boolean {
+    return this.pos < this.buffer.length;
+  }
+
+  // Private helpers
+
+  private zigZagDecode32(n: number): number {
+    return (n >>> 1) ^ -(n & 1);
+  }
+
+  private zigZagDecode64(n: bigint): bigint {
+    return (n >> 1n) ^ -(n & 1n);
+  }
+
+  private readVarInt(): number {
+    let n = 0;
+    let shift = 0;
+    let b: number;
+    do {
+      b = this.buffer[this.pos++];
+      n |= (b & 0x7f) << shift;
+      shift += 7;
+    } while ((b & 0x80) !== 0);
+    return n;
+  }
+
+  private readVarLong(): bigint {
+    let n = 0n;
+    let shift = 0n;
+    let b: number;
+    do {
+      b = this.buffer[this.pos++];
+      n |= BigInt(b & 0x7f) << shift;
+      shift += 7n;
+    } while ((b & 0x80) !== 0);
+    return n;
+  }
+}
+
+// ============================================================================
+// Data File Encoding/Decoding
+// ============================================================================
+
+/** Data file structure for encoding/decoding */
+export interface EncodableDataFile {
+  content: number;
+  file_path: string;
+  file_format: string;
+  partition: Record<string, unknown>;
+  record_count: number;
+  file_size_in_bytes: number;
+  column_sizes?: Array<{ key: number; value: number }> | null;
+  value_counts?: Array<{ key: number; value: number }> | null;
+  null_value_counts?: Array<{ key: number; value: number }> | null;
+  nan_value_counts?: Array<{ key: number; value: number }> | null;
+  lower_bounds?: Array<{ key: number; value: Uint8Array }> | null;
+  upper_bounds?: Array<{ key: number; value: Uint8Array }> | null;
+  key_metadata?: Uint8Array | null;
+  split_offsets?: number[] | null;
+  equality_ids?: number[] | null;
+  sort_order_id?: number | null;
+  // v3 fields
+  first_row_id?: number | null;
+  referenced_data_file?: string | null;
+  content_offset?: number | null;
+  content_size_in_bytes?: number | null;
+}
+
+/** Partition field definition */
+export interface PartitionFieldDef {
+  name: string;
+  type: string;
+}
+
+/**
+ * Encode a data file to Avro binary format.
+ */
+export function encodeDataFile(
+  encoder: AvroEncoder,
+  dataFile: EncodableDataFile,
+  partitionFields: PartitionFieldDef[]
+): void {
+  // content (int)
+  encoder.writeInt(dataFile.content);
+  // file_path (string)
+  encoder.writeString(dataFile.file_path);
+  // file_format (string)
+  encoder.writeString(dataFile.file_format);
+  // partition (record)
+  for (const field of partitionFields) {
+    const value = dataFile.partition[field.name];
+    if (value === null || value === undefined) {
+      encoder.writeUnionIndex(0); // null
+    } else {
+      encoder.writeUnionIndex(1); // non-null
+      writePartitionValue(encoder, value, field.type);
+    }
+  }
+  // record_count (long)
+  encoder.writeLong(dataFile.record_count);
+  // file_size_in_bytes (long)
+  encoder.writeLong(dataFile.file_size_in_bytes);
+  // column_sizes (optional map as array)
+  writeOptionalKeyValueArray(encoder, dataFile.column_sizes, (kv) => {
+    encoder.writeInt(kv.key);
+    encoder.writeLong(kv.value);
+  });
+  // value_counts
+  writeOptionalKeyValueArray(encoder, dataFile.value_counts, (kv) => {
+    encoder.writeInt(kv.key);
+    encoder.writeLong(kv.value);
+  });
+  // null_value_counts
+  writeOptionalKeyValueArray(encoder, dataFile.null_value_counts, (kv) => {
+    encoder.writeInt(kv.key);
+    encoder.writeLong(kv.value);
+  });
+  // nan_value_counts
+  writeOptionalKeyValueArray(encoder, dataFile.nan_value_counts, (kv) => {
+    encoder.writeInt(kv.key);
+    encoder.writeLong(kv.value);
+  });
+  // lower_bounds
+  writeOptionalKeyValueArray(encoder, dataFile.lower_bounds, (kv) => {
+    encoder.writeInt(kv.key);
+    encoder.writeBytes(kv.value);
+  });
+  // upper_bounds
+  writeOptionalKeyValueArray(encoder, dataFile.upper_bounds, (kv) => {
+    encoder.writeInt(kv.key);
+    encoder.writeBytes(kv.value);
+  });
+  // key_metadata
+  writeOptionalBytes(encoder, dataFile.key_metadata);
+  // split_offsets
+  writeOptionalLongArray(encoder, dataFile.split_offsets);
+  // equality_ids
+  writeOptionalIntArray(encoder, dataFile.equality_ids);
+  // sort_order_id
+  writeOptionalInt(encoder, dataFile.sort_order_id);
+  // v3 fields
+  // first_row_id
+  writeOptionalLong(encoder, dataFile.first_row_id);
+  // referenced_data_file
+  writeOptionalString(encoder, dataFile.referenced_data_file);
+  // content_offset
+  writeOptionalLong(encoder, dataFile.content_offset);
+  // content_size_in_bytes
+  writeOptionalLong(encoder, dataFile.content_size_in_bytes);
+}
+
+/**
+ * Decode a data file from Avro binary format.
+ */
+export function decodeDataFile(
+  decoder: AvroDecoder,
+  partitionFields: PartitionFieldDef[]
+): EncodableDataFile {
+  // content (int)
+  const content = decoder.readInt();
+  // file_path (string)
+  const file_path = decoder.readString();
+  // file_format (string)
+  const file_format = decoder.readString();
+  // partition (record)
+  const partition: Record<string, unknown> = {};
+  for (const field of partitionFields) {
+    const unionIndex = decoder.readUnionIndex();
+    if (unionIndex === 0) {
+      partition[field.name] = null;
+    } else {
+      partition[field.name] = readPartitionValue(decoder, field.type);
+    }
+  }
+  // record_count (long)
+  const record_count = decoder.readLong();
+  // file_size_in_bytes (long)
+  const file_size_in_bytes = decoder.readLong();
+  // column_sizes
+  const column_sizes = readOptionalKeyValueArray(decoder, () => ({
+    key: decoder.readInt(),
+    value: decoder.readLong(),
+  }));
+  // value_counts
+  const value_counts = readOptionalKeyValueArray(decoder, () => ({
+    key: decoder.readInt(),
+    value: decoder.readLong(),
+  }));
+  // null_value_counts
+  const null_value_counts = readOptionalKeyValueArray(decoder, () => ({
+    key: decoder.readInt(),
+    value: decoder.readLong(),
+  }));
+  // nan_value_counts
+  const nan_value_counts = readOptionalKeyValueArray(decoder, () => ({
+    key: decoder.readInt(),
+    value: decoder.readLong(),
+  }));
+  // lower_bounds
+  const lower_bounds = readOptionalKeyValueArray(decoder, () => ({
+    key: decoder.readInt(),
+    value: decoder.readBytes(),
+  }));
+  // upper_bounds
+  const upper_bounds = readOptionalKeyValueArray(decoder, () => ({
+    key: decoder.readInt(),
+    value: decoder.readBytes(),
+  }));
+  // key_metadata
+  const key_metadata = readOptionalBytes(decoder);
+  // split_offsets
+  const split_offsets = readOptionalLongArray(decoder);
+  // equality_ids
+  const equality_ids = readOptionalIntArray(decoder);
+  // sort_order_id
+  const sort_order_id = readOptionalInt(decoder);
+  // v3 fields
+  // first_row_id
+  const first_row_id = readOptionalLong(decoder);
+  // referenced_data_file
+  const referenced_data_file = readOptionalString(decoder);
+  // content_offset
+  const content_offset = readOptionalLong(decoder);
+  // content_size_in_bytes
+  const content_size_in_bytes = readOptionalLong(decoder);
+
+  return {
+    content,
+    file_path,
+    file_format,
+    partition,
+    record_count,
+    file_size_in_bytes,
+    column_sizes,
+    value_counts,
+    null_value_counts,
+    nan_value_counts,
+    lower_bounds,
+    upper_bounds,
+    key_metadata,
+    split_offsets,
+    equality_ids,
+    sort_order_id,
+    first_row_id,
+    referenced_data_file,
+    content_offset,
+    content_size_in_bytes,
+  };
+}
+
+// ============================================================================
+// Manifest Entry Encoding/Decoding
+// ============================================================================
+
+/** Manifest entry structure for encoding/decoding */
+export interface EncodableManifestEntry {
+  status: number;
+  snapshot_id: number | null;
+  sequence_number: number | null;
+  file_sequence_number: number | null;
+  data_file: EncodableDataFile;
+}
+
+/**
+ * Encode a manifest entry to Avro binary format.
+ */
+export function encodeManifestEntry(
+  encoder: AvroEncoder,
+  entry: EncodableManifestEntry,
+  partitionFields: PartitionFieldDef[]
+): void {
+  // status (int)
+  encoder.writeInt(entry.status);
+  // snapshot_id (optional long)
+  writeOptionalLong(encoder, entry.snapshot_id);
+  // sequence_number (optional long)
+  writeOptionalLong(encoder, entry.sequence_number);
+  // file_sequence_number (optional long)
+  writeOptionalLong(encoder, entry.file_sequence_number);
+  // data_file (record)
+  encodeDataFile(encoder, entry.data_file, partitionFields);
+}
+
+/**
+ * Decode a manifest entry from Avro binary format.
+ */
+export function decodeManifestEntry(
+  decoder: AvroDecoder,
+  partitionFields: PartitionFieldDef[]
+): EncodableManifestEntry {
+  // status (int)
+  const status = decoder.readInt();
+  // snapshot_id (optional long)
+  const snapshot_id = readOptionalLong(decoder);
+  // sequence_number (optional long)
+  const sequence_number = readOptionalLong(decoder);
+  // file_sequence_number (optional long)
+  const file_sequence_number = readOptionalLong(decoder);
+  // data_file (record)
+  const data_file = decodeDataFile(decoder, partitionFields);
+
+  return {
+    status,
+    snapshot_id,
+    sequence_number,
+    file_sequence_number,
+    data_file,
+  };
+}
+
+// ============================================================================
+// Manifest List Entry Encoding/Decoding
+// ============================================================================
+
+/** Manifest list entry structure for encoding/decoding */
+export interface EncodableManifestListEntry {
+  manifest_path: string;
+  manifest_length: number;
+  partition_spec_id: number;
+  content: number;
+  sequence_number: number;
+  min_sequence_number: number;
+  added_snapshot_id: number;
+  added_files_count: number;
+  existing_files_count: number;
+  deleted_files_count: number;
+  added_rows_count: number;
+  existing_rows_count: number;
+  deleted_rows_count: number;
+  partitions?: Array<{
+    contains_null: boolean;
+    contains_nan?: boolean | null;
+    lower_bound?: Uint8Array | null;
+    upper_bound?: Uint8Array | null;
+  }> | null;
+  // v3 field
+  first_row_id?: number | null;
+}
+
+/**
+ * Encode a manifest list entry to Avro binary format.
+ */
+export function encodeManifestListEntry(
+  encoder: AvroEncoder,
+  entry: EncodableManifestListEntry
+): void {
+  // manifest_path (string)
+  encoder.writeString(entry.manifest_path);
+  // manifest_length (long)
+  encoder.writeLong(entry.manifest_length);
+  // partition_spec_id (int)
+  encoder.writeInt(entry.partition_spec_id);
+  // content (int)
+  encoder.writeInt(entry.content);
+  // sequence_number (long)
+  encoder.writeLong(entry.sequence_number);
+  // min_sequence_number (long)
+  encoder.writeLong(entry.min_sequence_number);
+  // added_snapshot_id (long)
+  encoder.writeLong(entry.added_snapshot_id);
+  // added_files_count (int)
+  encoder.writeInt(entry.added_files_count);
+  // existing_files_count (int)
+  encoder.writeInt(entry.existing_files_count);
+  // deleted_files_count (int)
+  encoder.writeInt(entry.deleted_files_count);
+  // added_rows_count (long)
+  encoder.writeLong(entry.added_rows_count);
+  // existing_rows_count (long)
+  encoder.writeLong(entry.existing_rows_count);
+  // deleted_rows_count (long)
+  encoder.writeLong(entry.deleted_rows_count);
+  // partitions (optional array)
+  if (entry.partitions === null || entry.partitions === undefined) {
+    encoder.writeUnionIndex(0); // null
+  } else {
+    encoder.writeUnionIndex(1); // non-null
+    encoder.writeArray(entry.partitions, (p) => {
+      encoder.writeBoolean(p.contains_null);
+      writeOptionalBoolean(encoder, p.contains_nan);
+      writeOptionalBytes(encoder, p.lower_bound);
+      writeOptionalBytes(encoder, p.upper_bound);
+    });
+  }
+  // first_row_id (v3)
+  writeOptionalLong(encoder, entry.first_row_id);
+}
+
+/**
+ * Decode a manifest list entry from Avro binary format.
+ */
+export function decodeManifestListEntry(
+  decoder: AvroDecoder
+): EncodableManifestListEntry {
+  // manifest_path (string)
+  const manifest_path = decoder.readString();
+  // manifest_length (long)
+  const manifest_length = decoder.readLong();
+  // partition_spec_id (int)
+  const partition_spec_id = decoder.readInt();
+  // content (int)
+  const content = decoder.readInt();
+  // sequence_number (long)
+  const sequence_number = decoder.readLong();
+  // min_sequence_number (long)
+  const min_sequence_number = decoder.readLong();
+  // added_snapshot_id (long)
+  const added_snapshot_id = decoder.readLong();
+  // added_files_count (int)
+  const added_files_count = decoder.readInt();
+  // existing_files_count (int)
+  const existing_files_count = decoder.readInt();
+  // deleted_files_count (int)
+  const deleted_files_count = decoder.readInt();
+  // added_rows_count (long)
+  const added_rows_count = decoder.readLong();
+  // existing_rows_count (long)
+  const existing_rows_count = decoder.readLong();
+  // deleted_rows_count (long)
+  const deleted_rows_count = decoder.readLong();
+  // partitions (optional array)
+  const partitionsUnionIndex = decoder.readUnionIndex();
+  let partitions: EncodableManifestListEntry['partitions'] = null;
+  if (partitionsUnionIndex === 1) {
+    partitions = decoder.readArray(() => ({
+      contains_null: decoder.readBoolean(),
+      contains_nan: readOptionalBoolean(decoder),
+      lower_bound: readOptionalBytes(decoder),
+      upper_bound: readOptionalBytes(decoder),
+    }));
+  }
+  // first_row_id (v3)
+  const first_row_id = readOptionalLong(decoder);
+
+  return {
+    manifest_path,
+    manifest_length,
+    partition_spec_id,
+    content,
+    sequence_number,
+    min_sequence_number,
+    added_snapshot_id,
+    added_files_count,
+    existing_files_count,
+    deleted_files_count,
+    added_rows_count,
+    existing_rows_count,
+    deleted_rows_count,
+    partitions,
+    first_row_id,
+  };
+}
+
+// ============================================================================
+// Helper Functions for Optional Types
+// ============================================================================
+
+function writeOptionalLong(encoder: AvroEncoder, value: number | null | undefined): void {
+  if (value === null || value === undefined) {
+    encoder.writeUnionIndex(0); // null
+  } else {
+    encoder.writeUnionIndex(1); // non-null
+    encoder.writeLong(value);
+  }
+}
+
+function readOptionalLong(decoder: AvroDecoder): number | null {
+  const unionIndex = decoder.readUnionIndex();
+  if (unionIndex === 0) {
+    return null;
+  }
+  return decoder.readLong();
+}
+
+function writeOptionalInt(encoder: AvroEncoder, value: number | null | undefined): void {
+  if (value === null || value === undefined) {
+    encoder.writeUnionIndex(0); // null
+  } else {
+    encoder.writeUnionIndex(1); // non-null
+    encoder.writeInt(value);
+  }
+}
+
+function readOptionalInt(decoder: AvroDecoder): number | null {
+  const unionIndex = decoder.readUnionIndex();
+  if (unionIndex === 0) {
+    return null;
+  }
+  return decoder.readInt();
+}
+
+function writeOptionalString(encoder: AvroEncoder, value: string | null | undefined): void {
+  if (value === null || value === undefined) {
+    encoder.writeUnionIndex(0); // null
+  } else {
+    encoder.writeUnionIndex(1); // non-null
+    encoder.writeString(value);
+  }
+}
+
+function readOptionalString(decoder: AvroDecoder): string | null {
+  const unionIndex = decoder.readUnionIndex();
+  if (unionIndex === 0) {
+    return null;
+  }
+  return decoder.readString();
+}
+
+function writeOptionalBoolean(encoder: AvroEncoder, value: boolean | null | undefined): void {
+  if (value === null || value === undefined) {
+    encoder.writeUnionIndex(0); // null
+  } else {
+    encoder.writeUnionIndex(1); // non-null
+    encoder.writeBoolean(value);
+  }
+}
+
+function readOptionalBoolean(decoder: AvroDecoder): boolean | null {
+  const unionIndex = decoder.readUnionIndex();
+  if (unionIndex === 0) {
+    return null;
+  }
+  return decoder.readBoolean();
+}
+
+function writeOptionalBytes(encoder: AvroEncoder, value: Uint8Array | null | undefined): void {
+  if (value === null || value === undefined) {
+    encoder.writeUnionIndex(0); // null
+  } else {
+    encoder.writeUnionIndex(1); // non-null
+    encoder.writeBytes(value);
+  }
+}
+
+function readOptionalBytes(decoder: AvroDecoder): Uint8Array | null {
+  const unionIndex = decoder.readUnionIndex();
+  if (unionIndex === 0) {
+    return null;
+  }
+  return decoder.readBytes();
+}
+
+function writeOptionalKeyValueArray<T>(
+  encoder: AvroEncoder,
+  value: T[] | null | undefined,
+  writeElement: (element: T) => void
+): void {
+  if (value === null || value === undefined) {
+    encoder.writeUnionIndex(0); // null
+  } else {
+    encoder.writeUnionIndex(1); // non-null
+    encoder.writeArray(value, writeElement);
+  }
+}
+
+function readOptionalKeyValueArray<T>(
+  decoder: AvroDecoder,
+  readElement: () => T
+): T[] | null {
+  const unionIndex = decoder.readUnionIndex();
+  if (unionIndex === 0) {
+    return null;
+  }
+  return decoder.readArray(readElement);
+}
+
+function writeOptionalLongArray(encoder: AvroEncoder, value: number[] | null | undefined): void {
+  if (value === null || value === undefined) {
+    encoder.writeUnionIndex(0); // null
+  } else {
+    encoder.writeUnionIndex(1); // non-null
+    encoder.writeArray(value, (v) => encoder.writeLong(v));
+  }
+}
+
+function readOptionalLongArray(decoder: AvroDecoder): number[] | null {
+  const unionIndex = decoder.readUnionIndex();
+  if (unionIndex === 0) {
+    return null;
+  }
+  return decoder.readArray(() => decoder.readLong());
+}
+
+function writeOptionalIntArray(encoder: AvroEncoder, value: number[] | null | undefined): void {
+  if (value === null || value === undefined) {
+    encoder.writeUnionIndex(0); // null
+  } else {
+    encoder.writeUnionIndex(1); // non-null
+    encoder.writeArray(value, (v) => encoder.writeInt(v));
+  }
+}
+
+function readOptionalIntArray(decoder: AvroDecoder): number[] | null {
+  const unionIndex = decoder.readUnionIndex();
+  if (unionIndex === 0) {
+    return null;
+  }
+  return decoder.readArray(() => decoder.readInt());
+}
+
+function writePartitionValue(encoder: AvroEncoder, value: unknown, type: string): void {
+  switch (type) {
+    case 'int':
+      encoder.writeInt(value as number);
+      break;
+    case 'long':
+      encoder.writeLong(value as number);
+      break;
+    case 'string':
+      encoder.writeString(value as string);
+      break;
+    case 'boolean':
+      encoder.writeBoolean(value as boolean);
+      break;
+    case 'float':
+      encoder.writeFloat(value as number);
+      break;
+    case 'double':
+      encoder.writeDouble(value as number);
+      break;
+    case 'bytes':
+      encoder.writeBytes(value as Uint8Array);
+      break;
+    default:
+      encoder.writeString(String(value));
+  }
+}
+
+function readPartitionValue(decoder: AvroDecoder, type: string): unknown {
+  switch (type) {
+    case 'int':
+      return decoder.readInt();
+    case 'long':
+      return decoder.readLong();
+    case 'string':
+      return decoder.readString();
+    case 'boolean':
+      return decoder.readBoolean();
+    case 'float':
+      return decoder.readFloat();
+    case 'double':
+      return decoder.readDouble();
+    case 'bytes':
+      return decoder.readBytes();
+    default:
+      return decoder.readString();
+  }
 }
