@@ -5,7 +5,7 @@
  * Cloudflare R2 Data Catalog for Iceberg metadata operations.
  */
 
-import { describe, bench, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, bench, beforeAll, afterAll } from 'vitest';
 import {
   createIcebergDoClient,
   createR2CatalogClient,
@@ -15,24 +15,59 @@ import {
 import {
   CleanupContext,
   generateBenchmarkNamespace,
-  generateTableNames,
 } from './utils/cleanup.js';
 import { globalMetrics, benchmarkConcurrent } from './utils/metrics.js';
 import { DATASETS, IMDB_MOVIES_SCHEMA, IMDB_PARTITION_BY_YEAR } from './datasets/index.js';
 
 // ============================================================================
-// Setup
+// Global Setup - All namespaces created before any benchmarks
 // ============================================================================
 
 const cleanup = new CleanupContext();
 let icebergDoClient: CatalogClient;
 let r2Client: CatalogClient | null;
-let testNamespace: string[];
+
+// Pre-allocated namespaces for each benchmark category
+const namespaces = {
+  nsCreate: null as string[] | null,
+  nsList: null as string[] | null,
+  tblCreate: null as string[] | null,
+  tblLoad: null as string[] | null,
+  list10: null as string[] | null,
+  list50: null as string[] | null,
+  commit: null as string[] | null,
+  concurrent: null as string[] | null,
+  seqPar: null as string[] | null,
+  throughput: null as string[] | null,
+};
+
+// Table names and schemas
+const SIMPLE_SCHEMA = {
+  type: 'struct' as const,
+  'schema-id': 0,
+  fields: [
+    { id: 1, name: 'id', required: true, type: 'long' as const },
+    { id: 2, name: 'name', required: true, type: 'string' as const },
+    { id: 3, name: 'value', required: false, type: 'double' as const },
+    { id: 4, name: 'active', required: true, type: 'boolean' as const },
+    { id: 5, name: 'created_at', required: true, type: 'timestamptz' as const },
+  ],
+};
+
+const MINIMAL_SCHEMA = {
+  type: 'struct' as const,
+  'schema-id': 0,
+  fields: [{ id: 1, name: 'id', required: true, type: 'long' as const }],
+};
+
+// Counters for unique names
+let tableCounter = 0;
+let nsCounter = 0;
 
 // Benchmark iterations
 const ITERATIONS = 10;
 
-beforeAll(() => {
+beforeAll(async () => {
   icebergDoClient = createIcebergDoClient();
   r2Client = createR2CatalogClient();
 
@@ -42,18 +77,100 @@ beforeAll(() => {
         '   Only running iceberg.do benchmarks\n'
     );
   }
+
+  console.log('\n📦 Setting up benchmark namespaces...\n');
+
+  // Create all namespaces and required tables upfront
+  try {
+    // 1. Table creation namespace
+    namespaces.tblCreate = generateBenchmarkNamespace('tbl_create');
+    await icebergDoClient.createNamespace(namespaces.tblCreate);
+    cleanup.register(icebergDoClient, namespaces.tblCreate);
+
+    // 2. Table loading namespace with pre-created table
+    namespaces.tblLoad = generateBenchmarkNamespace('tbl_load');
+    await icebergDoClient.createNamespace(namespaces.tblLoad);
+    await icebergDoClient.createTable({
+      name: 'load_test_table',
+      namespace: namespaces.tblLoad,
+      schema: IMDB_MOVIES_SCHEMA,
+      partitionSpec: IMDB_PARTITION_BY_YEAR,
+    });
+    cleanup.register(icebergDoClient, namespaces.tblLoad);
+
+    // 3. List 10 tables namespace
+    namespaces.list10 = generateBenchmarkNamespace('list_10');
+    await icebergDoClient.createNamespace(namespaces.list10);
+    for (let i = 0; i < 10; i++) {
+      await icebergDoClient.createTable({
+        name: `table_${i}`,
+        namespace: namespaces.list10,
+        schema: MINIMAL_SCHEMA,
+      });
+    }
+    cleanup.register(icebergDoClient, namespaces.list10);
+
+    // 4. List 50 tables namespace
+    namespaces.list50 = generateBenchmarkNamespace('list_50');
+    await icebergDoClient.createNamespace(namespaces.list50);
+    const batchSize = 10;
+    for (let batch = 0; batch < 5; batch++) {
+      await Promise.all(
+        Array.from({ length: batchSize }, (_, i) =>
+          icebergDoClient.createTable({
+            name: `table_${batch * batchSize + i}`,
+            namespace: namespaces.list50,
+            schema: MINIMAL_SCHEMA,
+          })
+        )
+      );
+    }
+    cleanup.register(icebergDoClient, namespaces.list50);
+
+    // 5. Commit namespace with table
+    namespaces.commit = generateBenchmarkNamespace('commit');
+    await icebergDoClient.createNamespace(namespaces.commit);
+    await icebergDoClient.createTable({
+      name: 'commit_test',
+      namespace: namespaces.commit,
+      schema: IMDB_MOVIES_SCHEMA,
+    });
+    cleanup.register(icebergDoClient, namespaces.commit);
+
+    // 6. Concurrent load namespace with table
+    namespaces.concurrent = generateBenchmarkNamespace('concurrent');
+    await icebergDoClient.createNamespace(namespaces.concurrent);
+    await icebergDoClient.createTable({
+      name: 'concurrent_load',
+      namespace: namespaces.concurrent,
+      schema: IMDB_MOVIES_SCHEMA,
+    });
+    cleanup.register(icebergDoClient, namespaces.concurrent);
+
+    // 7. Sequential vs parallel namespace
+    namespaces.seqPar = generateBenchmarkNamespace('seq_par');
+    await icebergDoClient.createNamespace(namespaces.seqPar);
+    cleanup.register(icebergDoClient, namespaces.seqPar);
+
+    // 8. Throughput namespace
+    namespaces.throughput = generateBenchmarkNamespace('throughput');
+    await icebergDoClient.createNamespace(namespaces.throughput);
+    cleanup.register(icebergDoClient, namespaces.throughput);
+
+    console.log('✅ Setup complete\n');
+  } catch (error) {
+    console.error('❌ Setup failed:', error);
+    throw error;
+  }
 });
 
 afterAll(async () => {
-  // Clean up all test resources
   const result = await cleanup.cleanup();
   if (result.namespacesDropped > 0) {
     console.log(
-      `\nCleanup: dropped ${result.namespacesDropped} namespaces, ${result.tablesDropped} tables`
+      `\n🧹 Cleanup: dropped ${result.namespacesDropped} namespaces, ${result.tablesDropped} tables`
     );
   }
-
-  // Print collected metrics
   globalMetrics.printResults();
 });
 
@@ -62,66 +179,23 @@ afterAll(async () => {
 // ============================================================================
 
 describe('Namespace Operations', () => {
-  describe('Create Namespace', () => {
-    if (shouldBenchmarkCatalog('iceberg.do')) {
-      bench(
-        'iceberg.do - create namespace',
-        async () => {
-          const ns = generateBenchmarkNamespace('ns_create');
-          await icebergDoClient.createNamespace(ns, { benchmark: 'true' });
-          cleanup.register(icebergDoClient, ns);
-        },
-        { iterations: ITERATIONS }
-      );
-    }
+  bench(
+    'iceberg.do - create namespace',
+    async () => {
+      const ns = [`ns_create_${Date.now()}_${nsCounter++}`];
+      await icebergDoClient.createNamespace(ns, { benchmark: 'true' });
+      cleanup.register(icebergDoClient, ns);
+    },
+    { iterations: ITERATIONS }
+  );
 
-    if (r2Client && shouldBenchmarkCatalog('r2-data-catalog')) {
-      bench(
-        'r2-data-catalog - create namespace',
-        async () => {
-          const ns = generateBenchmarkNamespace('ns_create');
-          await r2Client!.createNamespace(ns, { benchmark: 'true' });
-          cleanup.register(r2Client!, ns);
-        },
-        { iterations: ITERATIONS }
-      );
-    }
-  });
-
-  describe('List Namespaces', () => {
-    beforeAll(async () => {
-      // Create test namespaces for listing
-      testNamespace = generateBenchmarkNamespace('ns_list');
-      await icebergDoClient.createNamespace(testNamespace);
-      cleanup.register(icebergDoClient, testNamespace);
-
-      if (r2Client) {
-        const r2Ns = generateBenchmarkNamespace('ns_list_r2');
-        await r2Client.createNamespace(r2Ns);
-        cleanup.register(r2Client, r2Ns);
-      }
-    });
-
-    if (shouldBenchmarkCatalog('iceberg.do')) {
-      bench(
-        'iceberg.do - list namespaces',
-        async () => {
-          await icebergDoClient.listNamespaces();
-        },
-        { iterations: ITERATIONS }
-      );
-    }
-
-    if (r2Client && shouldBenchmarkCatalog('r2-data-catalog')) {
-      bench(
-        'r2-data-catalog - list namespaces',
-        async () => {
-          await r2Client!.listNamespaces();
-        },
-        { iterations: ITERATIONS }
-      );
-    }
-  });
+  bench(
+    'iceberg.do - list namespaces',
+    async () => {
+      await icebergDoClient.listNamespaces();
+    },
+    { iterations: ITERATIONS }
+  );
 });
 
 // ============================================================================
@@ -129,118 +203,52 @@ describe('Namespace Operations', () => {
 // ============================================================================
 
 describe('Table Creation', () => {
-  let createTableNs: string[];
+  bench(
+    'iceberg.do - create simple table (5 fields)',
+    async () => {
+      await icebergDoClient.createTable({
+        name: `simple_${tableCounter++}`,
+        namespace: namespaces.tblCreate!,
+        schema: SIMPLE_SCHEMA,
+      });
+    },
+    { iterations: ITERATIONS }
+  );
 
-  beforeAll(async () => {
-    createTableNs = generateBenchmarkNamespace('tbl_create');
-    await icebergDoClient.createNamespace(createTableNs);
-    cleanup.register(icebergDoClient, createTableNs);
+  bench(
+    'iceberg.do - create IMDB table (15 fields + partition)',
+    async () => {
+      await icebergDoClient.createTable({
+        name: `imdb_${tableCounter++}`,
+        namespace: namespaces.tblCreate!,
+        schema: IMDB_MOVIES_SCHEMA,
+        partitionSpec: IMDB_PARTITION_BY_YEAR,
+      });
+    },
+    { iterations: ITERATIONS }
+  );
+});
 
-    if (r2Client) {
-      await r2Client.createNamespace(createTableNs);
-      cleanup.register(r2Client, createTableNs);
-    }
-  });
+// ============================================================================
+// Dataset Schema Benchmarks
+// ============================================================================
 
-  describe('Simple Schema (5 fields)', () => {
-    const simpleSchema = {
-      type: 'struct' as const,
-      'schema-id': 0,
-      fields: [
-        { id: 1, name: 'id', required: true, type: 'long' as const },
-        { id: 2, name: 'name', required: true, type: 'string' as const },
-        { id: 3, name: 'value', required: false, type: 'double' as const },
-        { id: 4, name: 'active', required: true, type: 'boolean' as const },
-        { id: 5, name: 'created_at', required: true, type: 'timestamptz' as const },
-      ],
-    };
-
-    let tableCounter = 0;
-
-    if (shouldBenchmarkCatalog('iceberg.do')) {
-      bench(
-        'iceberg.do - create simple table',
-        async () => {
-          await icebergDoClient.createTable({
-            name: `simple_${tableCounter++}`,
-            namespace: createTableNs,
-            schema: simpleSchema,
-          });
-        },
-        { iterations: ITERATIONS }
-      );
-    }
-
-    if (r2Client && shouldBenchmarkCatalog('r2-data-catalog')) {
-      bench(
-        'r2-data-catalog - create simple table',
-        async () => {
-          await r2Client!.createTable({
-            name: `simple_r2_${tableCounter++}`,
-            namespace: createTableNs,
-            schema: simpleSchema,
-          });
-        },
-        { iterations: ITERATIONS }
-      );
-    }
-  });
-
-  describe('Complex Schema (IMDB - 15 fields)', () => {
-    let tableCounter = 0;
-
-    if (shouldBenchmarkCatalog('iceberg.do')) {
-      bench(
-        'iceberg.do - create IMDB table',
-        async () => {
-          await icebergDoClient.createTable({
-            name: `imdb_${tableCounter++}`,
-            namespace: createTableNs,
-            schema: IMDB_MOVIES_SCHEMA,
-            partitionSpec: IMDB_PARTITION_BY_YEAR,
-          });
-        },
-        { iterations: ITERATIONS }
-      );
-    }
-
-    if (r2Client && shouldBenchmarkCatalog('r2-data-catalog')) {
-      bench(
-        'r2-data-catalog - create IMDB table',
-        async () => {
-          await r2Client!.createTable({
-            name: `imdb_r2_${tableCounter++}`,
-            namespace: createTableNs,
-            schema: IMDB_MOVIES_SCHEMA,
-            partitionSpec: IMDB_PARTITION_BY_YEAR,
-          });
-        },
-        { iterations: ITERATIONS }
-      );
-    }
-  });
-
-  describe('All Datasets', () => {
-    for (const dataset of DATASETS) {
-      let tableCounter = 0;
-
-      if (shouldBenchmarkCatalog('iceberg.do')) {
-        bench(
-          `iceberg.do - create ${dataset.name}`,
-          async () => {
-            await icebergDoClient.createTable({
-              name: `${dataset.name}_${tableCounter++}`,
-              namespace: createTableNs,
-              schema: dataset.schema,
-              partitionSpec: dataset.partitionSpec,
-              properties: dataset.properties,
-            });
-          },
-          { iterations: Math.min(ITERATIONS, 5) }
-        );
-      }
-    }
-  });
+describe('Create All Dataset Schemas', () => {
+  for (const dataset of DATASETS) {
+    bench(
+      `iceberg.do - create ${dataset.name} (${dataset.fieldCount} fields)`,
+      async () => {
+        await icebergDoClient.createTable({
+          name: `${dataset.name}_${tableCounter++}`,
+          namespace: namespaces.tblCreate!,
+          schema: dataset.schema,
+          partitionSpec: dataset.partitionSpec,
+          properties: dataset.properties,
+        });
+      },
+      { iterations: 5 }
+    );
+  }
 });
 
 // ============================================================================
@@ -248,51 +256,13 @@ describe('Table Creation', () => {
 // ============================================================================
 
 describe('Table Loading', () => {
-  let loadTableNs: string[];
-  const tableName = 'load_test_table';
-
-  beforeAll(async () => {
-    loadTableNs = generateBenchmarkNamespace('tbl_load');
-    await icebergDoClient.createNamespace(loadTableNs);
-    await icebergDoClient.createTable({
-      name: tableName,
-      namespace: loadTableNs,
-      schema: IMDB_MOVIES_SCHEMA,
-      partitionSpec: IMDB_PARTITION_BY_YEAR,
-    });
-    cleanup.register(icebergDoClient, loadTableNs);
-
-    if (r2Client) {
-      await r2Client.createNamespace(loadTableNs);
-      await r2Client.createTable({
-        name: tableName,
-        namespace: loadTableNs,
-        schema: IMDB_MOVIES_SCHEMA,
-        partitionSpec: IMDB_PARTITION_BY_YEAR,
-      });
-      cleanup.register(r2Client, loadTableNs);
-    }
-  });
-
-  if (shouldBenchmarkCatalog('iceberg.do')) {
-    bench(
-      'iceberg.do - load table',
-      async () => {
-        await icebergDoClient.loadTable(loadTableNs, tableName);
-      },
-      { iterations: ITERATIONS * 2 }
-    );
-  }
-
-  if (r2Client && shouldBenchmarkCatalog('r2-data-catalog')) {
-    bench(
-      'r2-data-catalog - load table',
-      async () => {
-        await r2Client!.loadTable(loadTableNs, tableName);
-      },
-      { iterations: ITERATIONS * 2 }
-    );
-  }
+  bench(
+    'iceberg.do - load table',
+    async () => {
+      await icebergDoClient.loadTable(namespaces.tblLoad!, 'load_test_table');
+    },
+    { iterations: ITERATIONS * 2 }
+  );
 });
 
 // ============================================================================
@@ -300,79 +270,21 @@ describe('Table Loading', () => {
 // ============================================================================
 
 describe('Table Listing', () => {
-  describe('Small namespace (10 tables)', () => {
-    let listNs10: string[];
+  bench(
+    'iceberg.do - list 10 tables',
+    async () => {
+      await icebergDoClient.listTables(namespaces.list10!);
+    },
+    { iterations: ITERATIONS }
+  );
 
-    beforeAll(async () => {
-      listNs10 = generateBenchmarkNamespace('list_10');
-      await icebergDoClient.createNamespace(listNs10);
-
-      const simpleSchema = {
-        type: 'struct' as const,
-        'schema-id': 0,
-        fields: [{ id: 1, name: 'id', required: true, type: 'long' as const }],
-      };
-
-      for (let i = 0; i < 10; i++) {
-        await icebergDoClient.createTable({
-          name: `table_${i}`,
-          namespace: listNs10,
-          schema: simpleSchema,
-        });
-      }
-      cleanup.register(icebergDoClient, listNs10);
-    });
-
-    if (shouldBenchmarkCatalog('iceberg.do')) {
-      bench(
-        'iceberg.do - list 10 tables',
-        async () => {
-          await icebergDoClient.listTables(listNs10);
-        },
-        { iterations: ITERATIONS }
-      );
-    }
-  });
-
-  describe('Medium namespace (50 tables)', () => {
-    let listNs50: string[];
-
-    beforeAll(async () => {
-      listNs50 = generateBenchmarkNamespace('list_50');
-      await icebergDoClient.createNamespace(listNs50);
-
-      const simpleSchema = {
-        type: 'struct' as const,
-        'schema-id': 0,
-        fields: [{ id: 1, name: 'id', required: true, type: 'long' as const }],
-      };
-
-      // Create tables in parallel batches
-      const batchSize = 10;
-      for (let batch = 0; batch < 5; batch++) {
-        await Promise.all(
-          Array.from({ length: batchSize }, (_, i) =>
-            icebergDoClient.createTable({
-              name: `table_${batch * batchSize + i}`,
-              namespace: listNs50,
-              schema: simpleSchema,
-            })
-          )
-        );
-      }
-      cleanup.register(icebergDoClient, listNs50);
-    });
-
-    if (shouldBenchmarkCatalog('iceberg.do')) {
-      bench(
-        'iceberg.do - list 50 tables',
-        async () => {
-          await icebergDoClient.listTables(listNs50);
-        },
-        { iterations: ITERATIONS }
-      );
-    }
-  });
+  bench(
+    'iceberg.do - list 50 tables',
+    async () => {
+      await icebergDoClient.listTables(namespaces.list50!);
+    },
+    { iterations: ITERATIONS }
+  );
 });
 
 // ============================================================================
@@ -380,57 +292,17 @@ describe('Table Listing', () => {
 // ============================================================================
 
 describe('Commit Operations', () => {
-  let commitNs: string[];
-  const commitTableName = 'commit_test';
+  let propCounter = 0;
 
-  beforeAll(async () => {
-    commitNs = generateBenchmarkNamespace('commit');
-    await icebergDoClient.createNamespace(commitNs);
-    await icebergDoClient.createTable({
-      name: commitTableName,
-      namespace: commitNs,
-      schema: IMDB_MOVIES_SCHEMA,
-    });
-    cleanup.register(icebergDoClient, commitNs);
-
-    if (r2Client) {
-      await r2Client.createNamespace(commitNs);
-      await r2Client.createTable({
-        name: commitTableName,
-        namespace: commitNs,
-        schema: IMDB_MOVIES_SCHEMA,
+  bench(
+    'iceberg.do - property update commit (with OCC)',
+    async () => {
+      await icebergDoClient.commitPropertyUpdate(namespaces.commit!, 'commit_test', {
+        [`benchmark.prop.${propCounter++}`]: `value_${Date.now()}`,
       });
-      cleanup.register(r2Client, commitNs);
-    }
-  });
-
-  describe('Property Update Commit', () => {
-    let propCounter = 0;
-
-    if (shouldBenchmarkCatalog('iceberg.do')) {
-      bench(
-        'iceberg.do - property update commit',
-        async () => {
-          await icebergDoClient.commitPropertyUpdate(commitNs, commitTableName, {
-            [`benchmark.prop.${propCounter++}`]: `value_${Date.now()}`,
-          });
-        },
-        { iterations: ITERATIONS }
-      );
-    }
-
-    if (r2Client && shouldBenchmarkCatalog('r2-data-catalog')) {
-      bench(
-        'r2-data-catalog - property update',
-        async () => {
-          await r2Client!.commitPropertyUpdate(commitNs, commitTableName, {
-            [`benchmark.prop.${propCounter++}`]: `value_${Date.now()}`,
-          });
-        },
-        { iterations: ITERATIONS }
-      );
-    }
-  });
+    },
+    { iterations: ITERATIONS }
+  );
 });
 
 // ============================================================================
@@ -438,98 +310,59 @@ describe('Commit Operations', () => {
 // ============================================================================
 
 describe('Concurrent Operations', () => {
-  describe('Concurrent Table Loads', () => {
-    let concurrentNs: string[];
-    const concurrentTable = 'concurrent_load';
-
-    beforeAll(async () => {
-      concurrentNs = generateBenchmarkNamespace('concurrent');
-      await icebergDoClient.createNamespace(concurrentNs);
-      await icebergDoClient.createTable({
-        name: concurrentTable,
-        namespace: concurrentNs,
-        schema: IMDB_MOVIES_SCHEMA,
-      });
-      cleanup.register(icebergDoClient, concurrentNs);
-    });
-
-    if (shouldBenchmarkCatalog('iceberg.do')) {
-      bench(
-        'iceberg.do - 10 concurrent loads',
-        async () => {
-          await Promise.all(
-            Array.from({ length: 10 }, () =>
-              icebergDoClient.loadTable(concurrentNs, concurrentTable)
-            )
-          );
-        },
-        { iterations: 5 }
+  bench(
+    'iceberg.do - 10 concurrent loads',
+    async () => {
+      await Promise.all(
+        Array.from({ length: 10 }, () =>
+          icebergDoClient.loadTable(namespaces.concurrent!, 'concurrent_load')
+        )
       );
+    },
+    { iterations: 5 }
+  );
 
-      bench(
-        'iceberg.do - 50 concurrent loads',
-        async () => {
-          await Promise.all(
-            Array.from({ length: 50 }, () =>
-              icebergDoClient.loadTable(concurrentNs, concurrentTable)
-            )
-          );
-        },
-        { iterations: 3 }
+  bench(
+    'iceberg.do - 50 concurrent loads',
+    async () => {
+      await Promise.all(
+        Array.from({ length: 50 }, () =>
+          icebergDoClient.loadTable(namespaces.concurrent!, 'concurrent_load')
+        )
       );
-    }
-  });
+    },
+    { iterations: 3 }
+  );
 
-  describe('Sequential vs Parallel Creation', () => {
-    let seqParNs: string[];
+  bench(
+    'iceberg.do - 5 sequential creates',
+    async () => {
+      for (let i = 0; i < 5; i++) {
+        await icebergDoClient.createTable({
+          name: `seq_${tableCounter++}`,
+          namespace: namespaces.seqPar!,
+          schema: MINIMAL_SCHEMA,
+        });
+      }
+    },
+    { iterations: 3 }
+  );
 
-    beforeAll(async () => {
-      seqParNs = generateBenchmarkNamespace('seq_par');
-      await icebergDoClient.createNamespace(seqParNs);
-      cleanup.register(icebergDoClient, seqParNs);
-    });
-
-    const simpleSchema = {
-      type: 'struct' as const,
-      'schema-id': 0,
-      fields: [{ id: 1, name: 'id', required: true, type: 'long' as const }],
-    };
-
-    let seqCounter = 0;
-    let parCounter = 0;
-
-    if (shouldBenchmarkCatalog('iceberg.do')) {
-      bench(
-        'iceberg.do - 5 sequential creates',
-        async () => {
-          for (let i = 0; i < 5; i++) {
-            await icebergDoClient.createTable({
-              name: `seq_${seqCounter++}`,
-              namespace: seqParNs,
-              schema: simpleSchema,
-            });
-          }
-        },
-        { iterations: 3 }
+  bench(
+    'iceberg.do - 5 parallel creates',
+    async () => {
+      await Promise.all(
+        Array.from({ length: 5 }, () =>
+          icebergDoClient.createTable({
+            name: `par_${tableCounter++}`,
+            namespace: namespaces.seqPar!,
+            schema: MINIMAL_SCHEMA,
+          })
+        )
       );
-
-      bench(
-        'iceberg.do - 5 parallel creates',
-        async () => {
-          await Promise.all(
-            Array.from({ length: 5 }, (_, i) =>
-              icebergDoClient.createTable({
-                name: `par_${parCounter++}`,
-                namespace: seqParNs,
-                schema: simpleSchema,
-              })
-            )
-          );
-        },
-        { iterations: 3 }
-      );
-    }
-  });
+    },
+    { iterations: 3 }
+  );
 });
 
 // ============================================================================
@@ -537,42 +370,21 @@ describe('Concurrent Operations', () => {
 // ============================================================================
 
 describe('Throughput Tests', () => {
-  describe('Table Creation Throughput', () => {
-    let throughputNs: string[];
-
-    beforeAll(async () => {
-      throughputNs = generateBenchmarkNamespace('throughput');
-      await icebergDoClient.createNamespace(throughputNs);
-      cleanup.register(icebergDoClient, throughputNs);
-    });
-
-    const simpleSchema = {
-      type: 'struct' as const,
-      'schema-id': 0,
-      fields: [{ id: 1, name: 'id', required: true, type: 'long' as const }],
-    };
-
-    let throughputCounter = 0;
-
-    if (shouldBenchmarkCatalog('iceberg.do')) {
-      bench(
-        'iceberg.do - 20 table creates (5 concurrent)',
-        async () => {
-          const results = await benchmarkConcurrent(
-            () =>
-              icebergDoClient.createTable({
-                name: `tp_${throughputCounter++}`,
-                namespace: throughputNs,
-                schema: simpleSchema,
-              }),
-            5, // concurrency
-            20 // total operations
-          );
-          // Log throughput for this run
-          globalMetrics.record('throughput-create-20', 'iceberg.do', results.stats.totalTimeMs);
-        },
-        { iterations: 2 }
+  bench(
+    'iceberg.do - 20 table creates (5 concurrent batches)',
+    async () => {
+      const results = await benchmarkConcurrent(
+        () =>
+          icebergDoClient.createTable({
+            name: `tp_${tableCounter++}`,
+            namespace: namespaces.throughput!,
+            schema: MINIMAL_SCHEMA,
+          }),
+        5,
+        20
       );
-    }
-  });
+      globalMetrics.record('throughput-create-20', 'iceberg.do', results.stats.totalTimeMs);
+    },
+    { iterations: 2 }
+  );
 });
