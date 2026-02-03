@@ -12,6 +12,7 @@
 import type { DataFile, IcebergPrimitiveType } from '../metadata/types.js';
 import type { VariantShredPropertyConfig } from './config.js';
 import { deserializeShreddedBound } from './manifest-stats.js';
+import { compareValues, isPlainObject, parseVariantPath } from './utils.js';
 
 // ============================================================================
 // Types
@@ -30,33 +31,6 @@ export interface PredicateResult {
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/**
- * Parse a variant field path to extract column name and field name.
- *
- * @param path - The full path (e.g., "$data.title" or "$data.user.name")
- * @returns Object with columnName and fieldName, or null if not a valid variant path
- */
-function parseVariantPath(path: string): { columnName: string; fieldName: string } | null {
-  // Must start with $ to be a variant column
-  if (!path.startsWith('$')) {
-    return null;
-  }
-
-  const dotIndex = path.indexOf('.');
-  if (dotIndex === -1) {
-    return null;
-  }
-
-  const columnName = path.substring(0, dotIndex);
-  const fieldName = path.substring(dotIndex + 1);
-
-  if (!columnName || !fieldName) {
-    return null;
-  }
-
-  return { columnName, fieldName };
-}
 
 /**
  * Get the statistics path for a field.
@@ -122,65 +96,6 @@ function getBoundsFromDataFile(
       : upperBound;
 
   return { lower, upper };
-}
-
-/**
- * Compare two values based on type.
- *
- * @returns Negative if a < b, positive if a > b, zero if equal
- */
-function compareValues(a: unknown, b: unknown, _type: IcebergPrimitiveType): number {
-  // Handle BigInt comparison
-  if (typeof a === 'bigint' && typeof b === 'bigint') {
-    if (a < b) return -1;
-    if (a > b) return 1;
-    return 0;
-  }
-
-  // Handle number comparison
-  if (typeof a === 'number' && typeof b === 'number') {
-    return a - b;
-  }
-
-  // Handle string comparison
-  if (typeof a === 'string' && typeof b === 'string') {
-    return a.localeCompare(b);
-  }
-
-  // Handle boolean comparison (false < true)
-  if (typeof a === 'boolean' && typeof b === 'boolean') {
-    return (a ? 1 : 0) - (b ? 1 : 0);
-  }
-
-  // Handle binary comparison (byte-by-byte)
-  if (a instanceof Uint8Array && b instanceof Uint8Array) {
-    const minLen = Math.min(a.length, b.length);
-    for (let i = 0; i < minLen; i++) {
-      if (a[i] !== b[i]) {
-        return a[i] - b[i];
-      }
-    }
-    return a.length - b.length;
-  }
-
-  // Fallback: convert to same type and compare
-  // Handle BigInt with number
-  if (typeof a === 'bigint' && typeof b === 'number') {
-    const bigB = BigInt(b);
-    if (a < bigB) return -1;
-    if (a > bigB) return 1;
-    return 0;
-  }
-
-  if (typeof a === 'number' && typeof b === 'bigint') {
-    const bigA = BigInt(a);
-    if (bigA < b) return -1;
-    if (bigA > b) return 1;
-    return 0;
-  }
-
-  // Final fallback: string comparison
-  return String(a).localeCompare(String(b));
 }
 
 // ============================================================================
@@ -293,13 +208,6 @@ export function evaluateInPredicate(
 // ============================================================================
 // Filter Evaluation
 // ============================================================================
-
-/**
- * Check if a value is a plain object (not array, null, etc.).
- */
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 /**
  * Evaluate a single field filter against data file stats.

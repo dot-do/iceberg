@@ -759,6 +759,102 @@ describe('getCurrentSnapshot', () => {
 });
 
 // ============================================================================
+// Error Handling Tests
+// ============================================================================
+
+describe('Error handling', () => {
+  let storage: ReturnType<typeof createMockStorage>;
+  const tableLocation = 's3://bucket/warehouse/db/table';
+
+  beforeEach(() => {
+    storage = createMockStorage();
+  });
+
+  describe('malformed JSON metadata', () => {
+    it('should throw appropriate error for invalid JSON', async () => {
+      const versionHintPath = `${tableLocation}/${METADATA_DIR}/${VERSION_HINT_FILENAME}`;
+      const metadataPath = `${tableLocation}/${METADATA_DIR}/v1.metadata.json`;
+
+      await storage.put(versionHintPath, new TextEncoder().encode('1'));
+      await storage.put(metadataPath, new TextEncoder().encode('{ invalid json'));
+
+      await expect(readTableMetadata(storage, tableLocation)).rejects.toThrow(
+        /Failed to parse table metadata JSON/
+      );
+    });
+
+    it('should throw appropriate error for truncated JSON', async () => {
+      const versionHintPath = `${tableLocation}/${METADATA_DIR}/${VERSION_HINT_FILENAME}`;
+      const metadataPath = `${tableLocation}/${METADATA_DIR}/v1.metadata.json`;
+
+      await storage.put(versionHintPath, new TextEncoder().encode('1'));
+      await storage.put(metadataPath, new TextEncoder().encode('{"format-version": 2, "table-uuid":'));
+
+      await expect(readTableMetadata(storage, tableLocation)).rejects.toThrow(
+        /Failed to parse table metadata JSON/
+      );
+    });
+
+    it('should throw appropriate error for empty JSON object', async () => {
+      const versionHintPath = `${tableLocation}/${METADATA_DIR}/${VERSION_HINT_FILENAME}`;
+      const metadataPath = `${tableLocation}/${METADATA_DIR}/v1.metadata.json`;
+
+      await storage.put(versionHintPath, new TextEncoder().encode('1'));
+      await storage.put(metadataPath, new TextEncoder().encode('{}'));
+
+      await expect(readTableMetadata(storage, tableLocation)).rejects.toThrow(
+        'Unsupported format version: undefined'
+      );
+    });
+  });
+
+  describe('missing metadata file', () => {
+    it('should return null for non-existent table', async () => {
+      const result = await readTableMetadata(storage, tableLocation);
+      expect(result).toBeNull();
+    });
+
+    it('should return null when version hint points to non-existent file', async () => {
+      const versionHintPath = `${tableLocation}/${METADATA_DIR}/${VERSION_HINT_FILENAME}`;
+      await storage.put(versionHintPath, new TextEncoder().encode('999'));
+
+      const result = await readTableMetadata(storage, tableLocation);
+      expect(result).toBeNull();
+    });
+
+    it('should throw when readMetadataFromPath called with missing file', async () => {
+      const metadataPath = `${tableLocation}/${METADATA_DIR}/v999.metadata.json`;
+
+      await expect(readMetadataFromPath(storage, metadataPath)).rejects.toThrow(
+        `Metadata file not found: ${metadataPath}`
+      );
+    });
+  });
+
+  describe('storage failures', () => {
+    it('should propagate storage get errors', async () => {
+      storage.get = async () => {
+        throw new Error('Storage unavailable');
+      };
+
+      await expect(readTableMetadata(storage, tableLocation)).rejects.toThrow(
+        'Storage unavailable'
+      );
+    });
+
+    it('should propagate storage list errors when no version hint', async () => {
+      storage.list = async () => {
+        throw new Error('Access denied');
+      };
+
+      await expect(readTableMetadata(storage, tableLocation)).rejects.toThrow(
+        'Access denied'
+      );
+    });
+  });
+});
+
+// ============================================================================
 // listMetadataFiles Tests
 // ============================================================================
 

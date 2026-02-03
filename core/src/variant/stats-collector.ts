@@ -32,9 +32,21 @@ export interface ColumnValues {
 }
 
 /**
- * Statistics for a single shredded column.
+ * Collected statistics for a single shredded column during the collection phase.
+ *
+ * This type represents shredded column statistics with raw (unserialized) bounds,
+ * as collected during data file processing. The bounds contain the actual typed
+ * values (strings, numbers, etc.) before binary serialization.
+ *
+ * Use this type when:
+ * - Collecting statistics from data during write operations
+ * - Processing column values before manifest serialization
+ * - Working with statistics in memory before final encoding
+ *
+ * @see {@link SerializedShreddedColumnStats} for the serialized form with binary-encoded bounds
+ * @see https://iceberg.apache.org/spec/#manifests
  */
-export interface ShreddedColumnStats {
+export interface CollectedShreddedColumnStats {
   /** The field path/name within the variant */
   readonly path: string;
   /** The Iceberg primitive type of the field */
@@ -52,11 +64,17 @@ export interface ShreddedColumnStats {
 }
 
 /**
+ * @deprecated Use {@link CollectedShreddedColumnStats} instead.
+ * This alias is provided for backward compatibility.
+ */
+export type ShreddedColumnStats = CollectedShreddedColumnStats;
+
+/**
  * Result of collecting statistics for shredded columns.
  */
 export interface CollectedStats {
   /** Statistics for each shredded column */
-  readonly stats: readonly ShreddedColumnStats[];
+  readonly stats: readonly CollectedShreddedColumnStats[];
   /** Map from field path to assigned field ID */
   readonly fieldIdMap: Map<string, number>;
 }
@@ -113,7 +131,7 @@ export function collectShreddedColumnStats(
   options?: CollectStatsOptions
 ): CollectedStats {
   const maxStringLength = options?.maxStringLength ?? 16;
-  const stats: ShreddedColumnStats[] = [];
+  const stats: CollectedShreddedColumnStats[] = [];
   const fieldIdMap = new Map<string, number>();
 
   // Build a set of configured field paths and their types
@@ -163,7 +181,7 @@ function computeColumnStats(
   fieldId: number,
   values: readonly unknown[],
   maxStringLength: number
-): ShreddedColumnStats {
+): CollectedShreddedColumnStats {
   let valueCount = 0;
   let nullCount = 0;
   let lowerBound: unknown = undefined;

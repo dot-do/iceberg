@@ -24,6 +24,16 @@ export {
   validateVariantShredConfig,
 } from './types.js';
 
+// ============================================================================
+// Shared Utility Functions
+// ============================================================================
+
+// Utility types
+export type { ParsedVariantPath } from './utils.js';
+
+// Utility functions
+export { isPlainObject, parseVariantPath, compareValues } from './utils.js';
+
 // Path generation functions
 export { getMetadataPath, getValuePath, getTypedValuePath } from './types.js';
 
@@ -32,7 +42,7 @@ export { getMetadataPath, getValuePath, getTypedValuePath } from './types.js';
 // ============================================================================
 
 // Property config types
-export type { VariantShredPropertyConfig } from './config.js';
+export type { VariantShredPropertyConfig, ShredConfigValidationResult } from './config.js';
 
 // Property key constants
 export {
@@ -94,8 +104,12 @@ export { transformVariantFilter, isComparisonOperator, isLogicalOperator } from 
 // Manifest Statistics for Shredded Columns
 // ============================================================================
 
-// Manifest stats types
-export type { ShreddedColumnStats, CreateShreddedStatsOptions } from './manifest-stats.js';
+// Manifest stats types - SerializedShreddedColumnStats (binary-encoded bounds for manifest storage)
+export type {
+  SerializedShreddedColumnStats,
+  ShreddedColumnStats, // Deprecated alias for backward compatibility
+  CreateShreddedStatsOptions,
+} from './manifest-stats.js';
 
 // Manifest stats functions
 export {
@@ -112,11 +126,12 @@ export {
 // Statistics Collection for Shredded Columns
 // ============================================================================
 
-// Stats collector types
+// Stats collector types - CollectedShreddedColumnStats (raw values during collection phase)
 export type {
   ColumnValues,
   CollectedStats,
-  ShreddedColumnStats as CollectedShreddedColumnStats,
+  CollectedShreddedColumnStats,
+  ShreddedColumnStats as ShreddedColumnStatsCollector, // Deprecated alias
   CollectStatsOptions,
 } from './stats-collector.js';
 

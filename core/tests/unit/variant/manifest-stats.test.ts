@@ -256,6 +256,131 @@ describe('Shredded Column Statistics in Manifests', () => {
       expect(result).toBeInstanceOf(Uint8Array);
       expect(result.length).toBe(4);
     });
+
+    // Type validation tests
+    describe('type validation', () => {
+      it('should throw for boolean type with non-boolean value', () => {
+        expect(() => serializeShreddedBound('true', 'boolean')).toThrow(
+          "Expected boolean for type 'boolean', got string"
+        );
+        expect(() => serializeShreddedBound(1, 'boolean')).toThrow(
+          "Expected boolean for type 'boolean', got number"
+        );
+      });
+
+      it('should throw for int type with non-number value', () => {
+        expect(() => serializeShreddedBound('42', 'int')).toThrow(
+          "Expected number for type 'int', got string"
+        );
+        expect(() => serializeShreddedBound(BigInt(42), 'int')).toThrow(
+          "Expected number for type 'int', got bigint"
+        );
+      });
+
+      it('should throw for date type with non-number value', () => {
+        expect(() => serializeShreddedBound('2024-01-01', 'date')).toThrow(
+          "Expected number for type 'date', got string"
+        );
+      });
+
+      it('should throw for long type with invalid value', () => {
+        expect(() => serializeShreddedBound('1000', 'long')).toThrow(
+          "Expected number or bigint for type 'long', got string"
+        );
+        expect(() => serializeShreddedBound(true, 'long')).toThrow(
+          "Expected number or bigint for type 'long', got boolean"
+        );
+      });
+
+      it('should throw for timestamp types with invalid value', () => {
+        expect(() => serializeShreddedBound('2024-01-01', 'timestamp')).toThrow(
+          "Expected number or bigint for type 'timestamp', got string"
+        );
+        expect(() => serializeShreddedBound({}, 'timestamptz')).toThrow(
+          "Expected number or bigint for type 'timestamptz', got object"
+        );
+      });
+
+      it('should throw for float type with non-number value', () => {
+        expect(() => serializeShreddedBound('3.14', 'float')).toThrow(
+          "Expected number for type 'float', got string"
+        );
+      });
+
+      it('should throw for double type with non-number value', () => {
+        expect(() => serializeShreddedBound('3.14', 'double')).toThrow(
+          "Expected number for type 'double', got string"
+        );
+        expect(() => serializeShreddedBound(null, 'double')).toThrow(
+          "Expected number for type 'double', got object"
+        );
+      });
+
+      it('should throw for string type with non-string value', () => {
+        expect(() => serializeShreddedBound(123, 'string')).toThrow(
+          "Expected string for type 'string', got number"
+        );
+        expect(() => serializeShreddedBound(['a', 'b'], 'string')).toThrow(
+          "Expected string for type 'string', got object"
+        );
+      });
+
+      it('should throw for uuid type with non-string value', () => {
+        expect(() => serializeShreddedBound(123, 'uuid')).toThrow(
+          "Expected string for type 'uuid', got number"
+        );
+      });
+
+      it('should throw for binary type with invalid value', () => {
+        expect(() => serializeShreddedBound('binary', 'binary')).toThrow(
+          "Expected Uint8Array or number[] for type 'binary', got string"
+        );
+        expect(() => serializeShreddedBound(123, 'binary')).toThrow(
+          "Expected Uint8Array or number[] for type 'binary', got number"
+        );
+      });
+
+      it('should throw for fixed type with invalid value', () => {
+        expect(() => serializeShreddedBound('fixed', 'fixed')).toThrow(
+          "Expected Uint8Array or number[] for type 'fixed', got string"
+        );
+      });
+
+      // Positive tests to ensure valid types still work
+      it('should accept valid boolean values', () => {
+        expect(() => serializeShreddedBound(true, 'boolean')).not.toThrow();
+        expect(() => serializeShreddedBound(false, 'boolean')).not.toThrow();
+      });
+
+      it('should accept valid number values for int and date', () => {
+        expect(() => serializeShreddedBound(42, 'int')).not.toThrow();
+        expect(() => serializeShreddedBound(19000, 'date')).not.toThrow();
+      });
+
+      it('should accept valid number or bigint values for long types', () => {
+        expect(() => serializeShreddedBound(1000, 'long')).not.toThrow();
+        expect(() => serializeShreddedBound(BigInt(1000), 'long')).not.toThrow();
+        expect(() => serializeShreddedBound(1000000, 'timestamp')).not.toThrow();
+        expect(() => serializeShreddedBound(BigInt(1000000), 'timestamptz')).not.toThrow();
+      });
+
+      it('should accept valid number values for float and double', () => {
+        expect(() => serializeShreddedBound(3.14, 'float')).not.toThrow();
+        expect(() => serializeShreddedBound(3.14159, 'double')).not.toThrow();
+      });
+
+      it('should accept valid string values for string and uuid', () => {
+        expect(() => serializeShreddedBound('hello', 'string')).not.toThrow();
+        expect(() => serializeShreddedBound('550e8400-e29b-41d4-a716-446655440000', 'uuid')).not.toThrow();
+      });
+
+      it('should accept valid Uint8Array or number[] for binary and fixed', () => {
+        expect(() => serializeShreddedBound(new Uint8Array([1, 2, 3]), 'binary')).not.toThrow();
+        expect(() => serializeShreddedBound([1, 2, 3], 'binary')).not.toThrow();
+        expect(() => serializeShreddedBound(new Uint8Array([1, 2, 3]), 'fixed')).not.toThrow();
+        expect(() => serializeShreddedBound([1, 2, 3], 'fixed')).not.toThrow();
+      });
+    });
   });
 
   // ==========================================================================

@@ -9,8 +9,14 @@
 /**
  * The Iceberg format version supported by this implementation.
  * This implementation supports Iceberg v2 format.
+ * Default to v2 for backward compatibility.
  */
 export declare const FORMAT_VERSION = 2;
+/**
+ * Iceberg format version 3.
+ * v3 adds additional features while maintaining backward compatibility with v2.
+ */
+export declare const FORMAT_VERSION_3 = 3;
 /**
  * The standard metadata directory name within a table location.
  * Metadata files are stored at: {table-location}/metadata/

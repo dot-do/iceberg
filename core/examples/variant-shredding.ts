@@ -71,11 +71,11 @@ const moviesShredConfig: VariantShredPropertyConfig = {
 };
 
 // Validate the configuration
-try {
-  validateShredConfig(moviesShredConfig);
+const validationResult = validateShredConfig(moviesShredConfig);
+if (validationResult.valid) {
   console.log('Configuration is valid');
-} catch (error) {
-  console.error('Invalid configuration:', error);
+} else {
+  console.error('Invalid configuration:', validationResult.errors);
 }
 
 // Convert to Iceberg table properties

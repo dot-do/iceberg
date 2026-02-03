@@ -5,7 +5,7 @@
  *
  * @see https://iceberg.apache.org/spec/#schema-evolution
  */
-import type { IcebergSchema, IcebergType, PartitionSpec, SortOrder } from './types.js';
+import type { IcebergSchema, IcebergStructField, IcebergType, PartitionSpec, SortOrder } from './types.js';
 /**
  * Create the default Iceberg schema with _id, _seq, _op, _data columns.
  * This is a generic schema suitable for document-style data.
@@ -103,4 +103,82 @@ export declare function generateSchemaId(existingSchemas: IcebergSchema[]): numb
  * Find the maximum field ID in a schema.
  */
 export declare function findMaxFieldId(schema: IcebergSchema): number;
+/** Validation result for field or schema validation */
+export interface FieldValidationResult {
+    /** Whether the validation passed */
+    valid: boolean;
+    /** List of validation errors */
+    errors: string[];
+}
+/**
+ * Validate a field with 'unknown' type.
+ *
+ * Per the Iceberg v3 spec, unknown type fields:
+ * - MUST be optional (required: false)
+ * - Always have null values (not stored in data files)
+ *
+ * @param field - The struct field to validate
+ * @returns Validation result with any errors
+ */
+export declare function validateUnknownTypeField(field: IcebergStructField): FieldValidationResult;
+/**
+ * Validate all fields in a schema, including nested struct fields.
+ *
+ * Validates:
+ * - Unknown type fields must be optional
+ * - Default values for special types (unknown, variant, geometry, geography)
+ * - Nested struct fields are validated recursively
+ *
+ * @param schema - The schema to validate
+ * @returns Validation result with any errors
+ */
+export declare function validateSchema(schema: IcebergSchema): FieldValidationResult;
+/** Options for default value validation */
+export interface FieldDefaultValidationOptions {
+    /**
+     * Whether this field is being added to an existing table.
+     * Required fields being added must have an initial-default.
+     */
+    isNewField?: boolean;
+}
+/**
+ * Validate default value for a field.
+ *
+ * Per the Iceberg spec:
+ * - Fields with type unknown, variant, geometry, or geography MUST have null defaults
+ * - Struct defaults must be empty {} or null (sub-field defaults tracked separately)
+ * - Required fields being added to an existing table must have initial-default
+ *
+ * @param field - The struct field to validate
+ * @param options - Validation options
+ * @returns Validation result with any errors
+ */
+export declare function validateFieldDefault(field: IcebergStructField, options?: FieldDefaultValidationOptions): FieldValidationResult;
+/** Result of checking if a default value can be changed */
+export interface DefaultChangeResult {
+    /** Whether the change is allowed */
+    allowed: boolean;
+    /** Reason if not allowed */
+    reason?: string;
+}
+/**
+ * Check if initial-default can be changed between schema versions.
+ *
+ * Per the Iceberg spec, initial-default cannot be changed once set.
+ *
+ * @param oldField - The old field definition
+ * @param newField - The new field definition
+ * @returns Whether the change is allowed
+ */
+export declare function canChangeInitialDefault(oldField: IcebergStructField, newField: IcebergStructField): DefaultChangeResult;
+/**
+ * Check if write-default can be changed between schema versions.
+ *
+ * Per the Iceberg spec, write-default can be changed through schema evolution.
+ *
+ * @param _oldField - The old field definition (unused, write-default can always change)
+ * @param _newField - The new field definition (unused)
+ * @returns Whether the change is allowed (always true)
+ */
+export declare function canChangeWriteDefault(_oldField: IcebergStructField, _newField: IcebergStructField): DefaultChangeResult;
 //# sourceMappingURL=schema.d.ts.map

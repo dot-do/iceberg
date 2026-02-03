@@ -343,25 +343,54 @@ export function toTableProperties(
 }
 
 // ============================================================================
+// Validation Types
+// ============================================================================
+
+/**
+ * Result of validating a shred configuration.
+ */
+export interface ShredConfigValidationResult {
+  /** Whether the configuration is valid */
+  readonly valid: boolean;
+  /** List of validation errors (empty if valid) */
+  readonly errors: readonly string[];
+}
+
+// ============================================================================
 // Validation Functions
 // ============================================================================
 
 /**
  * Validate a variant shred configuration.
  *
+ * Returns a validation result object instead of throwing errors,
+ * allowing callers to handle validation failures as they see fit.
+ *
  * @param config - Configuration to validate
- * @throws Error if configuration is invalid
+ * @returns Validation result with valid flag and any errors
+ *
+ * @example
+ * ```ts
+ * const result = validateShredConfig(config);
+ * if (!result.valid) {
+ *   console.error('Validation errors:', result.errors);
+ * }
+ * ```
  */
-export function validateShredConfig(config: VariantShredConfig): void {
+export function validateShredConfig(config: VariantShredConfig): ShredConfigValidationResult {
+  const errors: string[] = [];
+
   // Validate column name
   if (!config.columnName || config.columnName.trim() === '') {
-    throw new Error('Variant shred config requires a non-empty column name');
+    errors.push('Column name is required');
   }
 
   // Validate fields array
   if (!config.fields || config.fields.length === 0) {
-    throw new Error(
-      `Variant shred config for column '${config.columnName}' requires at least one field in fields array`
+    errors.push(
+      config.columnName
+        ? `At least one field is required for column '${config.columnName}'`
+        : 'At least one field is required'
     );
   }
 
@@ -372,16 +401,21 @@ export function validateShredConfig(config: VariantShredConfig): void {
   for (const [fieldName, typeName] of Object.entries(config.fieldTypes)) {
     // Check that field type is valid
     if (!VALID_PRIMITIVE_TYPES.has(typeName)) {
-      throw new Error(
-        `Invalid field type '${typeName}' for field '${fieldName}' in column '${config.columnName}'`
+      errors.push(
+        `Invalid field type '${typeName}' for field '${fieldName}'${config.columnName ? ` in column '${config.columnName}'` : ''}`
       );
     }
 
     // Check that field type references an existing field
     if (!declaredFields.has(fieldName)) {
-      throw new Error(
-        `Field type declared for field '${fieldName}' which is not declared in fields array for column '${config.columnName}'`
+      errors.push(
+        `Field type declared for field '${fieldName}' which is not declared in fields array${config.columnName ? ` for column '${config.columnName}'` : ''}`
       );
     }
   }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+  };
 }

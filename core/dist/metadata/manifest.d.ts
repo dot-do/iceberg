@@ -88,6 +88,17 @@ export declare class ManifestListGenerator {
     addManifest(manifest: Omit<ManifestFile, 'added-snapshot-id' | 'sequence-number' | 'min-sequence-number'>): void;
     /**
      * Add a manifest file with computed statistics.
+     *
+     * @param path - Path to the manifest file
+     * @param length - Length of the manifest file in bytes
+     * @param partitionSpecId - Partition spec ID used for this manifest
+     * @param summary - File and row count statistics
+     * @param isDeleteManifest - Whether this is a delete manifest (default: false)
+     * @param partitionSummaries - Optional partition field summaries
+     * @param firstRowId - Optional first row ID for v3 row lineage tracking.
+     *   - number: explicit first row ID for this manifest
+     *   - null: inherit from manifest list context
+     *   - undefined: field not included (v2 compatibility)
      */
     addManifestWithStats(path: string, length: number, partitionSpecId: number, summary: {
         addedFiles: number;
@@ -96,7 +107,7 @@ export declare class ManifestListGenerator {
         addedRows: number;
         existingRows: number;
         deletedRows: number;
-    }, isDeleteManifest?: boolean, partitionSummaries?: PartitionFieldSummary[]): void;
+    }, isDeleteManifest?: boolean, partitionSummaries?: PartitionFieldSummary[], firstRowId?: number | null): void;
     /**
      * Generate the manifest list content.
      */

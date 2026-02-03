@@ -44,9 +44,9 @@ import type {
  */
 export interface TableIdentifier {
   /** Hierarchical namespace path (e.g., ['database', 'schema']) */
-  namespace: string[];
+  readonly namespace: readonly string[];
   /** Table name within the namespace */
-  name: string;
+  readonly name: string;
 }
 
 /**

@@ -956,6 +956,154 @@ describe('Atomic Storage Operations', () => {
 });
 
 // ============================================================================
+// Storage Error Handling Tests
+// ============================================================================
+
+describe('Error handling', () => {
+  let storage: ReturnType<typeof createMockStorage>;
+  const tableLocation = 's3://bucket/warehouse/db/table';
+
+  beforeEach(async () => {
+    storage = createMockStorage();
+    // Setup initial table
+    const metadata = createTestMetadata(tableLocation);
+    const metadataPath = `${tableLocation}/metadata/v0.metadata.json`;
+    await storage.put(metadataPath, new TextEncoder().encode(JSON.stringify(metadata)));
+    await storage.put(getVersionHintPath(tableLocation), new TextEncoder().encode('0'));
+  });
+
+  it('should handle storage write failure gracefully', async () => {
+    const committer = new AtomicCommitter(storage, tableLocation);
+
+    // Make metadata write fail with a storage error
+    const originalPut = storage.put.bind(storage);
+    storage.put = async (key: string, value: Uint8Array) => {
+      if (key.includes('.metadata.json') && key !== `${tableLocation}/metadata/v0.metadata.json`) {
+        throw new Error('Disk full');
+      }
+      return originalPut(key, value);
+    };
+
+    // Also disable putIfAbsent to test put-based fallback
+    delete (storage as Partial<typeof storage>).putIfAbsent;
+
+    await expect(
+      committer.commit(async (metadata) => {
+        if (!metadata) throw new Error('No metadata');
+        const snapshot = createTestSnapshot(metadata['last-sequence-number'] + 1);
+        return { baseMetadata: metadata, snapshot };
+      })
+    ).rejects.toThrow('Disk full');
+  });
+
+  it('should handle storage read failure during commit', async () => {
+    const committer = new AtomicCommitter(storage, tableLocation);
+
+    // Make version hint read fail with network error
+    const originalGet = storage.get.bind(storage);
+    let callCount = 0;
+    storage.get = async (key: string) => {
+      callCount++;
+      // Fail on second call (during attemptCommit version check)
+      if (key.includes('version-hint') && callCount > 1) {
+        throw new Error('Network timeout');
+      }
+      return originalGet(key);
+    };
+
+    await expect(
+      committer.commit(async (metadata) => {
+        if (!metadata) throw new Error('No metadata');
+        const snapshot = createTestSnapshot(metadata['last-sequence-number'] + 1);
+        return { baseMetadata: metadata, snapshot };
+      })
+    ).rejects.toThrow('Network timeout');
+  });
+
+  it('should handle storage list failure during cleanup', async () => {
+    const committer = new AtomicCommitter(storage, tableLocation);
+
+    // Make list fail
+    storage.list = async () => {
+      throw new Error('Permission denied');
+    };
+
+    // Cleanup should handle this gracefully
+    const deleted = await committer.cleanupOldMetadata();
+    expect(deleted).toEqual([]);
+  });
+
+  it('should wrap non-conflict storage errors in CommitTransactionError', async () => {
+    const committer = new AtomicCommitter(storage, tableLocation);
+
+    // Remove atomic operations and make version hint write fail
+    delete (storage as Partial<typeof storage>).putIfAbsent;
+    delete (storage as Partial<typeof storage>).compareAndSwap;
+
+    const originalPut = storage.put.bind(storage);
+    storage.put = async (key: string, value: Uint8Array) => {
+      if (key.includes('version-hint')) {
+        throw new Error('Storage quota exceeded');
+      }
+      return originalPut(key, value);
+    };
+
+    await expect(
+      committer.commit(
+        async (metadata) => {
+          if (!metadata) throw new Error('No metadata');
+          const snapshot = createTestSnapshot(metadata['last-sequence-number'] + 1);
+          return { baseMetadata: metadata, snapshot };
+        },
+        { cleanupOnFailure: true }
+      )
+    ).rejects.toThrow(CommitTransactionError);
+  });
+
+  it('should handle intermittent storage failures with retry', async () => {
+    const committer = new AtomicCommitter(storage, tableLocation);
+
+    // Make first get call fail, then succeed
+    const originalGet = storage.get.bind(storage);
+    let callCount = 0;
+    storage.get = async (key: string) => {
+      callCount++;
+      if (key.includes('version-hint') && callCount === 1) {
+        throw new Error('Temporary network error');
+      }
+      return originalGet(key);
+    };
+
+    // This should fail because the first loadMetadata call fails
+    await expect(
+      committer.commit(async (metadata) => {
+        if (!metadata) throw new Error('No metadata');
+        const snapshot = createTestSnapshot(metadata['last-sequence-number'] + 1);
+        return { baseMetadata: metadata, snapshot };
+      })
+    ).rejects.toThrow('Temporary network error');
+  });
+
+  it('should handle metadata file corruption after successful write', async () => {
+    const committer = new AtomicCommitter(storage, tableLocation);
+
+    // Make exists check fail
+    storage.exists = async () => {
+      throw new Error('Connection reset');
+    };
+
+    // Commit should still work as exists is not critical
+    const result = await committer.commit(async (metadata) => {
+      if (!metadata) throw new Error('No metadata');
+      const snapshot = createTestSnapshot(metadata['last-sequence-number'] + 1);
+      return { baseMetadata: metadata, snapshot };
+    });
+
+    expect(result.metadataVersion).toBe(1);
+  });
+});
+
+// ============================================================================
 // Atomic Commit with Storage Operations Tests
 // ============================================================================
 

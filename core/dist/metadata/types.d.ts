@@ -6,7 +6,77 @@
  * @see https://iceberg.apache.org/spec/
  */
 /** Iceberg primitive types */
-export type IcebergPrimitiveType = 'boolean' | 'int' | 'long' | 'float' | 'double' | 'decimal' | 'date' | 'time' | 'timestamp' | 'timestamptz' | 'string' | 'uuid' | 'fixed' | 'binary';
+export type IcebergPrimitiveType = 'boolean' | 'int' | 'long' | 'float' | 'double' | 'decimal' | 'date' | 'time' | 'timestamp' | 'timestamptz' | 'timestamp_ns' | 'timestamptz_ns' | 'string' | 'uuid' | 'fixed' | 'binary' | 'variant' | 'unknown';
+/**
+ * Valid edge-interpolation algorithms for geography types.
+ * These determine how edges between coordinates are calculated on the sphere.
+ */
+export type EdgeInterpolationAlgorithm = 'spherical' | 'vincenty' | 'thomas' | 'andoyer' | 'karney';
+/** Array of valid edge-interpolation algorithms */
+export declare const VALID_EDGE_INTERPOLATION_ALGORITHMS: readonly EdgeInterpolationAlgorithm[];
+/** Default CRS for geospatial types */
+export declare const GEOSPATIAL_DEFAULT_CRS = "OGC:CRS84";
+/** Default edge-interpolation algorithm for geography types */
+export declare const GEOSPATIAL_DEFAULT_ALGORITHM: EdgeInterpolationAlgorithm;
+/**
+ * Parsed information for a geometry type.
+ * geometry(C) where C is the CRS parameter.
+ */
+export interface GeometryTypeInfo {
+    readonly crs: string;
+}
+/**
+ * Parsed information for a geography type.
+ * geography(C, A) where C is the CRS and A is the edge-interpolation algorithm.
+ */
+export interface GeographyTypeInfo {
+    readonly crs: string;
+    readonly algorithm: EdgeInterpolationAlgorithm;
+}
+/**
+ * Check if a type string represents a geospatial type (geometry or geography).
+ */
+export declare function isGeospatialType(type: string): boolean;
+/**
+ * Check if an algorithm name is a valid edge-interpolation algorithm.
+ */
+export declare function isValidEdgeInterpolationAlgorithm(algorithm: string): algorithm is EdgeInterpolationAlgorithm;
+/**
+ * Parse a geometry type string and extract its CRS parameter.
+ * Returns null if the type is not a geometry type.
+ *
+ * @example
+ * parseGeometryType('geometry') // { crs: 'OGC:CRS84' }
+ * parseGeometryType('geometry(EPSG:4326)') // { crs: 'EPSG:4326' }
+ */
+export declare function parseGeometryType(type: string): GeometryTypeInfo | null;
+/**
+ * Parse a geography type string and extract its CRS and algorithm parameters.
+ * Returns null if the type is not a geography type.
+ *
+ * @example
+ * parseGeographyType('geography') // { crs: 'OGC:CRS84', algorithm: 'spherical' }
+ * parseGeographyType('geography(EPSG:4326, vincenty)') // { crs: 'EPSG:4326', algorithm: 'vincenty' }
+ */
+export declare function parseGeographyType(type: string): GeographyTypeInfo | null;
+/**
+ * Serialize a GeometryTypeInfo back to its string representation.
+ * Uses the compact form if using default CRS.
+ *
+ * @example
+ * serializeGeometryType({ crs: 'OGC:CRS84' }) // 'geometry'
+ * serializeGeometryType({ crs: 'EPSG:4326' }) // 'geometry(EPSG:4326)'
+ */
+export declare function serializeGeometryType(info: GeometryTypeInfo): string;
+/**
+ * Serialize a GeographyTypeInfo back to its string representation.
+ * Uses the compact form if using default CRS and algorithm.
+ *
+ * @example
+ * serializeGeographyType({ crs: 'OGC:CRS84', algorithm: 'spherical' }) // 'geography'
+ * serializeGeographyType({ crs: 'EPSG:4326', algorithm: 'karney' }) // 'geography(EPSG:4326, karney)'
+ */
+export declare function serializeGeographyType(info: GeographyTypeInfo): string;
 /** Iceberg list type */
 export interface IcebergListType {
     readonly type: 'list';
@@ -30,6 +100,18 @@ export interface IcebergStructField {
     readonly required: boolean;
     readonly type: IcebergType;
     readonly doc?: string;
+    /**
+     * Default value for reading rows written before this field was added.
+     * Cannot be changed once set. Required for adding new required fields.
+     * @see https://iceberg.apache.org/spec/#default-values
+     */
+    readonly 'initial-default'?: unknown;
+    /**
+     * Default value for writing new rows that don't specify a value.
+     * Can be changed through schema evolution.
+     * @see https://iceberg.apache.org/spec/#default-values
+     */
+    readonly 'write-default'?: unknown;
 }
 /** Iceberg struct type */
 export interface IcebergStructType {
@@ -46,9 +128,21 @@ export interface IcebergSchema {
 }
 /** Partition transform types */
 export type PartitionTransform = 'identity' | 'bucket' | 'truncate' | 'year' | 'month' | 'day' | 'hour' | 'void';
-/** Partition field specification */
+/**
+ * Partition field specification.
+ *
+ * For single-argument transforms (most transforms), use 'source-id'.
+ * For multi-argument transforms (future use case), use 'source-ids' array.
+ *
+ * A partition field must have either 'source-id' OR 'source-ids', but not both.
+ *
+ * @see https://iceberg.apache.org/spec/#partitioning
+ */
 export interface PartitionField {
-    readonly 'source-id': number;
+    /** Source field ID for single-argument transforms */
+    readonly 'source-id'?: number;
+    /** Source field IDs for multi-argument transforms (Iceberg v3) */
+    readonly 'source-ids'?: readonly number[];
     readonly 'field-id': number;
     readonly name: string;
     readonly transform: PartitionTransform | string;
@@ -58,9 +152,21 @@ export interface PartitionSpec {
     readonly 'spec-id': number;
     readonly fields: readonly PartitionField[];
 }
-/** Sort field definition */
+/**
+ * Sort field definition.
+ *
+ * For single-argument transforms (most transforms), use 'source-id'.
+ * For multi-argument transforms (future use case), use 'source-ids' array.
+ *
+ * A sort field must have either 'source-id' OR 'source-ids', but not both.
+ *
+ * @see https://iceberg.apache.org/spec/#sorting
+ */
 export interface SortField {
-    readonly 'source-id': number;
+    /** Source field ID for single-argument transforms */
+    readonly 'source-id'?: number;
+    /** Source field IDs for multi-argument transforms (Iceberg v3) */
+    readonly 'source-ids'?: readonly number[];
     readonly transform: string;
     readonly direction: 'asc' | 'desc';
     readonly 'null-order': 'nulls-first' | 'nulls-last';
@@ -113,7 +219,92 @@ export interface DataFile extends BloomFilterRef {
     readonly 'split-offsets'?: readonly number[];
     readonly 'equality-ids'?: readonly number[];
     readonly 'sort-order-id'?: number;
+    /**
+     * Byte offset of the deletion vector blob within a Puffin file.
+     * Required for deletion vector entries (together with content-size-in-bytes).
+     * @see https://iceberg.apache.org/spec/#deletion-vectors
+     */
+    readonly 'content-offset'?: number;
+    /**
+     * Size of the deletion vector blob in bytes within a Puffin file.
+     * Required for deletion vector entries (together with content-offset).
+     * @see https://iceberg.apache.org/spec/#deletion-vectors
+     */
+    readonly 'content-size-in-bytes'?: number;
+    /**
+     * Path to the data file that this deletion vector references.
+     * Required for deletion vector entries - identifies which data file's rows are deleted.
+     * @see https://iceberg.apache.org/spec/#deletion-vectors
+     */
+    readonly 'referenced-data-file'?: string;
+    /**
+     * First row ID assigned to rows in this data file (Iceberg v3).
+     *
+     * For ADDED files (status=1), this can be null to indicate the value should
+     * be inherited from the manifest's first-row-id plus the cumulative record
+     * counts of preceding files in the manifest.
+     *
+     * For EXISTING files (status=0), this must be an explicit non-null value.
+     *
+     * The row ID for any row in this file is: first-row-id + row_position
+     * where row_position is the 0-based position of the row within the file.
+     *
+     * @see https://iceberg.apache.org/spec/#row-lineage
+     */
+    readonly 'first-row-id'?: number | null;
 }
+/** Result of validating deletion vector fields */
+export interface DeletionVectorValidationResult {
+    /** Whether the validation passed */
+    readonly valid: boolean;
+    /** List of validation error messages */
+    readonly errors: readonly string[];
+}
+/**
+ * Check if a DataFile represents a deletion vector.
+ *
+ * A deletion vector is a position delete file (content=1) that has all three
+ * deletion vector fields: content-offset, content-size-in-bytes, and referenced-data-file.
+ *
+ * @param dataFile - The DataFile to check
+ * @returns true if the DataFile is a deletion vector
+ */
+export declare function isDeletionVector(dataFile: DataFile): boolean;
+/**
+ * Validate deletion vector fields on a DataFile.
+ *
+ * Validates that:
+ * - content-offset and content-size-in-bytes are provided together
+ * - referenced-data-file is required when DV fields are present
+ *
+ * @param dataFile - The DataFile to validate
+ * @returns Validation result with any errors
+ */
+export declare function validateDeletionVectorFields(dataFile: DataFile): DeletionVectorValidationResult;
+/**
+ * Calculate the row ID for a specific row in a data file.
+ *
+ * The row ID is calculated as: first_row_id + row_position
+ * where row_position is the 0-based position of the row within the file.
+ *
+ * @param firstRowId - The first row ID assigned to this data file (or null/undefined)
+ * @param rowPosition - The 0-based position of the row within the data file
+ * @returns The unique row ID, or null if first_row_id is null or undefined
+ *
+ * @example
+ * ```ts
+ * // Data file with first-row-id of 5000
+ * const rowId = calculateRowId(5000, 42);
+ * console.log(rowId); // 5042
+ *
+ * // Data file with null first-row-id (inherits from manifest)
+ * const rowId = calculateRowId(null, 42);
+ * console.log(rowId); // null
+ * ```
+ *
+ * @see https://iceberg.apache.org/spec/#row-lineage
+ */
+export declare function calculateRowId(firstRowId: number | null | undefined, rowPosition: number): number | null;
 /** Manifest entry status */
 export type ManifestEntryStatus = 0 | 1 | 2;
 /** Manifest entry (row in manifest file) */
@@ -151,6 +342,15 @@ export interface ManifestFile {
     readonly 'existing-rows-count': number;
     readonly 'deleted-rows-count': number;
     readonly 'partitions'?: readonly PartitionFieldSummary[];
+    /**
+     * First row ID assigned to data files in this manifest (v3 only).
+     * Used for row lineage tracking.
+     * - number: explicit first row ID for this manifest
+     * - null: inherit from manifest list context (based on cumulative row counts)
+     * - undefined: field not present (v2 compatibility)
+     * @see https://iceberg.apache.org/spec/#manifest-lists
+     */
+    readonly 'first-row-id'?: number | null;
 }
 /** Snapshot summary statistics */
 export interface SnapshotSummary {
@@ -193,10 +393,48 @@ export interface Snapshot {
     readonly 'manifest-list': string;
     readonly summary: SnapshotSummary;
     readonly 'schema-id': number;
+    /**
+     * The first row ID assigned to rows added by this snapshot (v3 only).
+     * Equals the table's next-row-id at snapshot creation time.
+     * Required for format-version 3, must be non-negative.
+     * @see https://iceberg.apache.org/spec/#snapshots
+     */
+    readonly 'first-row-id'?: number;
+    /**
+     * Total number of rows added by this snapshot (v3 only).
+     * Required for format-version 3, must be non-negative.
+     * @see https://iceberg.apache.org/spec/#snapshots
+     */
+    readonly 'added-rows'?: number;
+    /**
+     * ID of the encryption key that encrypts the manifest list key metadata.
+     * Optional - only present when table encryption is enabled.
+     * References an encryption key from the table metadata's encryption-keys list.
+     * @see https://iceberg.apache.org/docs/nightly/encryption/
+     */
+    readonly 'key-id'?: number;
 }
-/** Iceberg table metadata (v2 format) */
+/**
+ * Encryption key metadata for table encryption.
+ * Used to store encryption key references in table metadata.
+ *
+ * @see https://iceberg.apache.org/spec/#table-metadata
+ */
+export interface EncryptionKey {
+    /**
+     * Unique identifier for the encryption key.
+     * Must be unique within the table's encryption-keys list.
+     */
+    readonly 'key-id': number;
+    /**
+     * Base64-encoded key metadata containing encrypted key material.
+     * The actual encryption key is wrapped/encrypted and stored here.
+     */
+    readonly 'key-metadata': string;
+}
+/** Iceberg table metadata (v2/v3 format) */
 export interface TableMetadata {
-    readonly 'format-version': 2;
+    readonly 'format-version': 2 | 3;
     readonly 'table-uuid': string;
     readonly location: string;
     readonly 'last-sequence-number': number;
@@ -215,6 +453,18 @@ export interface TableMetadata {
     readonly 'snapshot-log': readonly SnapshotLogEntry[];
     readonly 'metadata-log': readonly MetadataLogEntry[];
     readonly refs: Readonly<Record<string, SnapshotRef>>;
+    /**
+     * Next row ID to be assigned (v3 only).
+     * Required for format-version 3, must be non-negative.
+     * Used for row lineage tracking.
+     */
+    readonly 'next-row-id'?: number;
+    /**
+     * Optional list of encryption keys for table encryption.
+     * Each key has a unique key-id and base64-encoded key-metadata.
+     * @see https://iceberg.apache.org/spec/#table-metadata
+     */
+    readonly 'encryption-keys'?: readonly EncryptionKey[];
 }
 /**
  * Storage backend interface for Iceberg operations.

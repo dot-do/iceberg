@@ -8,7 +8,7 @@
 // Constants
 export { 
 // Format version
-FORMAT_VERSION, 
+FORMAT_VERSION, FORMAT_VERSION_3, 
 // Metadata directory
 METADATA_DIR, VERSION_HINT_FILENAME, 
 // Field IDs
@@ -27,6 +27,16 @@ POSITION_DELETE_SCHEMA_ID, EQUALITY_DELETE_SCHEMA_ID,
 COMMIT_MAX_RETRIES, DEFAULT_BASE_RETRY_DELAY_MS, DEFAULT_MAX_RETRY_DELAY_MS, DEFAULT_RETRY_JITTER, METADATA_RETAIN_VERSIONS, METADATA_MAX_AGE_MS, 
 // Time constants
 MS_PER_DAY, MS_PER_HOUR, EPOCH_YEAR, } from './constants.js';
+// Geospatial type utilities (v3)
+export { 
+// Constants
+VALID_EDGE_INTERPOLATION_ALGORITHMS, GEOSPATIAL_DEFAULT_CRS, GEOSPATIAL_DEFAULT_ALGORITHM, 
+// Functions
+isGeospatialType, isValidEdgeInterpolationAlgorithm, parseGeometryType, parseGeographyType, serializeGeometryType, serializeGeographyType, 
+// Deletion vector utilities
+isDeletionVector, validateDeletionVectorFields, 
+// Row lineage utilities (v3)
+calculateRowId, } from './types.js';
 // Reader
 export { readTableMetadata, readMetadataFromPath, parseTableMetadata, getCurrentVersion, getSnapshotAtTimestamp, getSnapshotByRef, getSnapshotById, getCurrentSnapshot, listMetadataFiles, } from './reader.js';
 // Writer
@@ -42,7 +52,11 @@ createDefaultSchema, createUnpartitionedSpec, createIdentityPartitionSpec, creat
 // Schema conversion
 parquetToIcebergType, parquetSchemaToIceberg, 
 // Schema evolution (legacy)
-validateSchemaEvolution, generateSchemaId, findMaxFieldId, } from './schema.js';
+validateSchemaEvolution, generateSchemaId, findMaxFieldId, 
+// Unknown type validation (v3)
+validateUnknownTypeField, validateSchema, 
+// Default values validation (v3)
+validateFieldDefault, canChangeInitialDefault, canChangeWriteDefault, } from './schema.js';
 // Schema Evolution (advanced)
 export { 
 // Type compatibility
@@ -113,4 +127,18 @@ AtomicCommitter,
 CommitConflictError, CommitRetryExhaustedError, CommitTransactionError, 
 // Functions
 createAtomicCommitter, commitWithCleanup, generateVersionedMetadataPath, parseMetadataVersion, getVersionHintPath, getMetadataVersion, } from './commit.js';
+// Deletion Vectors (v3 feature)
+export { 
+// Entry creation
+createDeletionVectorEntry, 
+// Scan planning
+findDeletionVectorsForFile, shouldIgnorePositionDeletes, 
+// V3 validation
+validateV3DeletionVectorRules, countDeletionVectorsPerDataFile, } from './deletion-vectors.js';
+// Version Upgrade (v2 to v3)
+export { 
+// Upgrade functions
+upgradeTableToV3, upgradeTableToV3WithOptions, canUpgradeToV3, 
+// Error handling
+VersionUpgradeError, } from './upgrade.js';
 //# sourceMappingURL=index.js.map

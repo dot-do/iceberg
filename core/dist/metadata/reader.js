@@ -5,7 +5,7 @@
  *
  * @see https://iceberg.apache.org/spec/
  */
-import { FORMAT_VERSION, METADATA_DIR, VERSION_HINT_FILENAME, } from './constants.js';
+import { FORMAT_VERSION, FORMAT_VERSION_3, METADATA_DIR, VERSION_HINT_FILENAME, } from './constants.js';
 import { validatePath } from '../utils/path-validation.js';
 // ============================================================================
 // Metadata Reader
@@ -109,8 +109,8 @@ export function parseTableMetadata(json) {
         throw new Error('Table metadata must be a JSON object');
     }
     const metadata = parsed;
-    // Validate required fields
-    if (metadata['format-version'] !== FORMAT_VERSION) {
+    // Validate required fields - support both v2 and v3 format versions
+    if (metadata['format-version'] !== FORMAT_VERSION && metadata['format-version'] !== FORMAT_VERSION_3) {
         throw new Error(`Unsupported format version: ${metadata['format-version']}`);
     }
     if (!metadata['table-uuid']) {

@@ -6,7 +6,7 @@
  *
  * @see https://iceberg.apache.org/spec/
  */
-import type { StorageBackend, IcebergSchema, PartitionSpec, SortOrder, TableMetadata, Snapshot } from './types.js';
+import type { StorageBackend, IcebergSchema, PartitionSpec, SortOrder, TableMetadata, Snapshot, EncryptionKey } from './types.js';
 /**
  * Options for creating table metadata.
  */
@@ -23,6 +23,12 @@ export interface MetadataWriterOptions {
     sortOrder?: SortOrder;
     /** Table properties */
     properties?: Record<string, string>;
+    /** Format version (2 or 3). Defaults to 2 for backward compatibility. */
+    formatVersion?: 2 | 3;
+    /** Initial next-row-id value (v3 only). Defaults to 0 for v3 tables. */
+    nextRowId?: number;
+    /** Optional encryption keys for table encryption. */
+    encryptionKeys?: EncryptionKey[];
 }
 /**
  * Result of a metadata write operation.

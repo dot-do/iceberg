@@ -39,10 +39,14 @@ const TYPE_PROMOTIONS = {
     time: [],
     timestamp: [],
     timestamptz: [],
+    timestamp_ns: [], // Iceberg v3: nanosecond precision timestamp
+    timestamptz_ns: [], // Iceberg v3: nanosecond precision timestamp with timezone
     string: [],
     uuid: [],
     fixed: ['binary'], // fixed -> binary is allowed
     binary: [],
+    variant: [], // Iceberg v3: semi-structured JSON-like data, no promotions
+    unknown: [], // Iceberg v3: unknown type - cannot be promoted to any other type
 };
 /**
  * Check if a type promotion is allowed.

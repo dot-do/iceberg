@@ -95,8 +95,10 @@ describe('Example 1: Creating table with shredding config', () => {
       fieldTypes: { title: 'string', year: 'int' },
     };
 
-    // Should not throw
-    expect(() => validateShredConfig(validConfig)).not.toThrow();
+    // Should return valid:true with no errors
+    const validResult = validateShredConfig(validConfig);
+    expect(validResult.valid).toBe(true);
+    expect(validResult.errors).toHaveLength(0);
 
     // Invalid: empty fields array
     const invalidConfig: VariantShredPropertyConfig = {
@@ -105,7 +107,9 @@ describe('Example 1: Creating table with shredding config', () => {
       fieldTypes: {},
     };
 
-    expect(() => validateShredConfig(invalidConfig)).toThrow(/fields/i);
+    const invalidResult = validateShredConfig(invalidConfig);
+    expect(invalidResult.valid).toBe(false);
+    expect(invalidResult.errors.some((e) => /field/i.test(e))).toBe(true);
   });
 
   it('should assign unique field IDs to shredded columns', () => {

@@ -72,12 +72,14 @@ export class MetadataWriter {
         const schema = options.schema ?? createDefaultSchema();
         const partitionSpec = options.partitionSpec ?? createUnpartitionedSpec();
         const sortOrder = options.sortOrder ?? createUnsortedOrder();
+        const formatVersion = options.formatVersion ?? FORMAT_VERSION;
         // Find the highest field ID in the schema
         const lastColumnId = this.findMaxFieldId(schema);
         // Find the highest partition field ID
         const lastPartitionId = this.findMaxPartitionFieldId(partitionSpec);
-        return {
-            'format-version': FORMAT_VERSION,
+        // Build base metadata
+        const baseMetadata = {
+            'format-version': formatVersion,
             'table-uuid': options.tableUuid ?? generateUUID(),
             location: options.location,
             'last-sequence-number': 0,
@@ -96,7 +98,19 @@ export class MetadataWriter {
             'snapshot-log': [],
             'metadata-log': [],
             refs: {},
+            // Add encryption keys if provided
+            ...(options.encryptionKeys && options.encryptionKeys.length > 0
+                ? { 'encryption-keys': options.encryptionKeys }
+                : {}),
         };
+        // Add next-row-id for v3 tables (required for row lineage)
+        if (formatVersion === 3) {
+            return {
+                ...baseMetadata,
+                'next-row-id': options.nextRowId ?? 0,
+            };
+        }
+        return baseMetadata;
     }
     /**
      * Write new table metadata to storage.
@@ -206,9 +220,9 @@ export class MetadataWriter {
      * @throws Error if validation fails
      */
     validateMetadata(metadata) {
-        // Check format version
-        if (metadata['format-version'] !== FORMAT_VERSION) {
-            throw new Error(`Invalid format-version: expected ${FORMAT_VERSION}, got ${metadata['format-version']}`);
+        // Check format version (accept 2 or 3)
+        if (metadata['format-version'] !== 2 && metadata['format-version'] !== 3) {
+            throw new Error(`Invalid format-version: expected 2 or 3, got ${metadata['format-version']}`);
         }
         // Check required string fields
         if (!metadata['table-uuid']) {
@@ -268,10 +282,63 @@ export class MetadataWriter {
         if (!schemaIds.has(metadata['current-schema-id'])) {
             throw new Error(`current-schema-id ${metadata['current-schema-id']} not found in schemas`);
         }
+        // Validate next-row-id for v3 tables (row lineage)
+        if (metadata['format-version'] === 3) {
+            if (typeof metadata['next-row-id'] !== 'number') {
+                throw new Error('Missing or invalid field: next-row-id (required for format-version 3)');
+            }
+            if (metadata['next-row-id'] < 0) {
+                throw new Error('Invalid next-row-id: must be non-negative');
+            }
+            // Validate snapshot row lineage fields for v3 tables
+            // Note: When a table is upgraded from v2 to v3, existing snapshots may not have
+            // row lineage fields (first-row-id, added-rows). These fields are optional for
+            // backward compatibility with upgraded tables. However, if present, they must be
+            // valid (non-negative numbers).
+            for (const snapshot of metadata.snapshots) {
+                // first-row-id is optional for backward compatibility with upgraded v2 snapshots
+                if (snapshot['first-row-id'] !== undefined) {
+                    if (typeof snapshot['first-row-id'] !== 'number') {
+                        throw new Error(`Invalid field: first-row-id in snapshot ${snapshot['snapshot-id']} must be a number`);
+                    }
+                    if (snapshot['first-row-id'] < 0) {
+                        throw new Error(`Invalid first-row-id in snapshot ${snapshot['snapshot-id']}: must be non-negative`);
+                    }
+                }
+                // added-rows is optional for backward compatibility with upgraded v2 snapshots
+                if (snapshot['added-rows'] !== undefined) {
+                    if (typeof snapshot['added-rows'] !== 'number') {
+                        throw new Error(`Invalid field: added-rows in snapshot ${snapshot['snapshot-id']} must be a number`);
+                    }
+                    if (snapshot['added-rows'] < 0) {
+                        throw new Error(`Invalid added-rows in snapshot ${snapshot['snapshot-id']}: must be non-negative`);
+                    }
+                }
+            }
+        }
         // Validate partition spec references
         const specIds = new Set(metadata['partition-specs'].map((s) => s['spec-id']));
         if (!specIds.has(metadata['default-spec-id'])) {
             throw new Error(`default-spec-id ${metadata['default-spec-id']} not found in partition-specs`);
+        }
+        // Validate encryption keys if present
+        if (metadata['encryption-keys']) {
+            const keyIds = new Set();
+            for (const key of metadata['encryption-keys']) {
+                // Validate key-id is a number
+                if (typeof key['key-id'] !== 'number') {
+                    throw new Error('Invalid encryption key: key-id must be a number');
+                }
+                // Validate key-metadata is a string
+                if (typeof key['key-metadata'] !== 'string') {
+                    throw new Error('Invalid encryption key: key-metadata must be a string');
+                }
+                // Check for duplicate key-ids
+                if (keyIds.has(key['key-id'])) {
+                    throw new Error(`Duplicate encryption key-id: ${key['key-id']}. Each key-id must be unique.`);
+                }
+                keyIds.add(key['key-id']);
+            }
         }
     }
     // ============================================================================

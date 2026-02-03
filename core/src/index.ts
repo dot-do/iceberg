@@ -543,14 +543,16 @@ export type {
   VariantShredConfigValidationResult,
   // Property config types
   VariantShredPropertyConfig,
+  ShredConfigValidationResult,
   // Statistics path types
   VariantFilterColumnsResult,
   // Filter transformation types
   TransformResult,
-  // Manifest stats types
-  ShreddedColumnStats,
+  // Manifest stats types - SerializedShreddedColumnStats has binary-encoded bounds for manifest storage
+  SerializedShreddedColumnStats,
+  ShreddedColumnStats, // Deprecated alias for SerializedShreddedColumnStats
   CreateShreddedStatsOptions,
-  // Stats collection types
+  // Stats collection types - CollectedShreddedColumnStats has raw values during collection phase
   ColumnValues,
   CollectedStats,
   CollectedShreddedColumnStats,

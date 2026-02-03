@@ -10,6 +10,7 @@
 
 import type { VariantShredPropertyConfig } from './config.js';
 import { getTypedValuePath } from './types.js';
+import { isPlainObject, parseVariantPath } from './utils.js';
 
 // ============================================================================
 // Types
@@ -77,33 +78,6 @@ export function isComparisonOperator(key: string): boolean {
  */
 export function isLogicalOperator(key: string): boolean {
   return LOGICAL_OPERATORS.has(key);
-}
-
-/**
- * Parse a variant field path to extract column name and field name.
- *
- * @param path - The full path (e.g., "$data.title" or "$data.user.name")
- * @returns Object with columnName and fieldName, or null if not a valid variant path
- */
-function parseVariantPath(path: string): { columnName: string; fieldName: string } | null {
-  // Must start with $ to be a variant column
-  if (!path.startsWith('$')) {
-    return null;
-  }
-
-  const dotIndex = path.indexOf('.');
-  if (dotIndex === -1) {
-    return null;
-  }
-
-  const columnName = path.substring(0, dotIndex);
-  const fieldName = path.substring(dotIndex + 1);
-
-  if (!columnName || !fieldName) {
-    return null;
-  }
-
-  return { columnName, fieldName };
 }
 
 /**
@@ -182,16 +156,6 @@ function transformValue(value: unknown, ctx: TransformContext): unknown {
   }
 
   return value;
-}
-
-/**
- * Check if a value is a plain object (not array, null, etc.).
- *
- * @param value - The value to check
- * @returns True if value is a plain object
- */
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /**

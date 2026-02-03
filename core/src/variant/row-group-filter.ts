@@ -11,6 +11,7 @@
 import type { DataFile, IcebergPrimitiveType } from '../metadata/types.js';
 import type { VariantShredPropertyConfig } from './config.js';
 import { deserializeShreddedBound } from './manifest-stats.js';
+import { compareValues } from './utils.js';
 
 // ============================================================================
 // Types
@@ -98,48 +99,6 @@ export function createRangePredicate(operator: string, value: unknown): RangePre
 // ============================================================================
 // Predicate Evaluation
 // ============================================================================
-
-/**
- * Compare two values of the same type.
- *
- * @param a - First value
- * @param b - Second value
- * @returns Negative if a < b, positive if a > b, zero if equal
- */
-function compareValues(a: unknown, b: unknown): number {
-  // Handle undefined/null
-  if (a === undefined || a === null) {
-    return b === undefined || b === null ? 0 : -1;
-  }
-  if (b === undefined || b === null) {
-    return 1;
-  }
-
-  // Handle BigInt
-  if (typeof a === 'bigint' && typeof b === 'bigint') {
-    if (a < b) return -1;
-    if (a > b) return 1;
-    return 0;
-  }
-
-  // Handle numbers
-  if (typeof a === 'number' && typeof b === 'number') {
-    return a - b;
-  }
-
-  // Handle strings
-  if (typeof a === 'string' && typeof b === 'string') {
-    return a.localeCompare(b);
-  }
-
-  // Handle booleans
-  if (typeof a === 'boolean' && typeof b === 'boolean') {
-    return (a ? 1 : 0) - (b ? 1 : 0);
-  }
-
-  // Fallback: convert to string
-  return String(a).localeCompare(String(b));
-}
 
 /**
  * Check if a value is within a range [lower, upper].

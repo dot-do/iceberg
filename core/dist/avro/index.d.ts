@@ -160,4 +160,178 @@ export declare function encodeStatValue(value: unknown, type: string): Uint8Arra
  * Iceberg uses truncated strings for min/max bounds to save space.
  */
 export declare function truncateString(value: string, length?: number): string;
+/**
+ * Avro binary decoder.
+ * Decodes values according to the Avro binary encoding specification.
+ */
+export declare class AvroDecoder {
+    private buffer;
+    private pos;
+    constructor(buffer: Uint8Array);
+    /**
+     * Read a null value (no bytes read).
+     */
+    readNull(): null;
+    /**
+     * Read a boolean value.
+     */
+    readBoolean(): boolean;
+    /**
+     * Read an int (32-bit signed) using variable-length zig-zag encoding.
+     */
+    readInt(): number;
+    /**
+     * Read a long (64-bit signed) using variable-length zig-zag encoding.
+     */
+    readLong(): number;
+    /**
+     * Read a float (32-bit IEEE 754).
+     */
+    readFloat(): number;
+    /**
+     * Read a double (64-bit IEEE 754).
+     */
+    readDouble(): number;
+    /**
+     * Read bytes (length-prefixed).
+     */
+    readBytes(): Uint8Array;
+    /**
+     * Read a string (UTF-8 encoded, length-prefixed).
+     */
+    readString(): string;
+    /**
+     * Read a fixed-length byte array.
+     */
+    readFixed(size: number): Uint8Array;
+    /**
+     * Read an enum value (as its ordinal index).
+     */
+    readEnum(): number;
+    /**
+     * Read the union index for a union type.
+     */
+    readUnionIndex(): number;
+    /**
+     * Read an array of values.
+     */
+    readArray<T>(readElement: () => T): T[];
+    /**
+     * Read a map of key-value pairs.
+     */
+    readMap<V>(readValue: () => V): Map<string, V>;
+    /**
+     * Get current position in buffer.
+     */
+    get position(): number;
+    /**
+     * Check if there are more bytes to read.
+     */
+    hasMore(): boolean;
+    private zigZagDecode32;
+    private zigZagDecode64;
+    private readVarInt;
+    private readVarLong;
+}
+/** Data file structure for encoding/decoding */
+export interface EncodableDataFile {
+    content: number;
+    file_path: string;
+    file_format: string;
+    partition: Record<string, unknown>;
+    record_count: number;
+    file_size_in_bytes: number;
+    column_sizes?: Array<{
+        key: number;
+        value: number;
+    }> | null;
+    value_counts?: Array<{
+        key: number;
+        value: number;
+    }> | null;
+    null_value_counts?: Array<{
+        key: number;
+        value: number;
+    }> | null;
+    nan_value_counts?: Array<{
+        key: number;
+        value: number;
+    }> | null;
+    lower_bounds?: Array<{
+        key: number;
+        value: Uint8Array;
+    }> | null;
+    upper_bounds?: Array<{
+        key: number;
+        value: Uint8Array;
+    }> | null;
+    key_metadata?: Uint8Array | null;
+    split_offsets?: number[] | null;
+    equality_ids?: number[] | null;
+    sort_order_id?: number | null;
+    first_row_id?: number | null;
+    referenced_data_file?: string | null;
+    content_offset?: number | null;
+    content_size_in_bytes?: number | null;
+}
+/** Partition field definition */
+export interface PartitionFieldDef {
+    name: string;
+    type: string;
+}
+/**
+ * Encode a data file to Avro binary format.
+ */
+export declare function encodeDataFile(encoder: AvroEncoder, dataFile: EncodableDataFile, partitionFields: PartitionFieldDef[]): void;
+/**
+ * Decode a data file from Avro binary format.
+ */
+export declare function decodeDataFile(decoder: AvroDecoder, partitionFields: PartitionFieldDef[]): EncodableDataFile;
+/** Manifest entry structure for encoding/decoding */
+export interface EncodableManifestEntry {
+    status: number;
+    snapshot_id: number | null;
+    sequence_number: number | null;
+    file_sequence_number: number | null;
+    data_file: EncodableDataFile;
+}
+/**
+ * Encode a manifest entry to Avro binary format.
+ */
+export declare function encodeManifestEntry(encoder: AvroEncoder, entry: EncodableManifestEntry, partitionFields: PartitionFieldDef[]): void;
+/**
+ * Decode a manifest entry from Avro binary format.
+ */
+export declare function decodeManifestEntry(decoder: AvroDecoder, partitionFields: PartitionFieldDef[]): EncodableManifestEntry;
+/** Manifest list entry structure for encoding/decoding */
+export interface EncodableManifestListEntry {
+    manifest_path: string;
+    manifest_length: number;
+    partition_spec_id: number;
+    content: number;
+    sequence_number: number;
+    min_sequence_number: number;
+    added_snapshot_id: number;
+    added_files_count: number;
+    existing_files_count: number;
+    deleted_files_count: number;
+    added_rows_count: number;
+    existing_rows_count: number;
+    deleted_rows_count: number;
+    partitions?: Array<{
+        contains_null: boolean;
+        contains_nan?: boolean | null;
+        lower_bound?: Uint8Array | null;
+        upper_bound?: Uint8Array | null;
+    }> | null;
+    first_row_id?: number | null;
+}
+/**
+ * Encode a manifest list entry to Avro binary format.
+ */
+export declare function encodeManifestListEntry(encoder: AvroEncoder, entry: EncodableManifestListEntry): void;
+/**
+ * Decode a manifest list entry from Avro binary format.
+ */
+export declare function decodeManifestListEntry(decoder: AvroDecoder): EncodableManifestListEntry;
 //# sourceMappingURL=index.d.ts.map

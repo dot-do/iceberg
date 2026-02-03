@@ -11,18 +11,29 @@
 
 import type { IcebergPrimitiveType, DataFile } from '../metadata/types.js';
 import type { VariantShredPropertyConfig } from './config.js';
+import { compareValues } from './utils.js';
 
 // ============================================================================
 // Types
 // ============================================================================
 
 /**
- * Statistics for a single shredded column.
+ * Serialized statistics for a single shredded column.
  *
- * Tracks bounds and counts for a shredded field, using the same field ID
- * mapping as regular Iceberg column statistics.
+ * This type represents shredded column statistics with binary-encoded bounds,
+ * ready for storage in Iceberg manifest files. The bounds are serialized using
+ * Iceberg's standard binary encoding per type (e.g., little-endian for integers,
+ * UTF-8 for strings).
+ *
+ * Use this type when:
+ * - Writing statistics to manifest files
+ * - Reading statistics from manifest files
+ * - Merging statistics during manifest compaction
+ *
+ * @see {@link CollectedShreddedColumnStats} for the pre-serialization form with raw values
+ * @see https://iceberg.apache.org/spec/#manifests
  */
-export interface ShreddedColumnStats {
+export interface SerializedShreddedColumnStats {
   /** The statistics path (e.g., "$data.typed_value.title.typed_value") */
   readonly path: string;
   /** The field ID assigned to this shredded column */
@@ -36,6 +47,12 @@ export interface ShreddedColumnStats {
   /** Count of non-null values */
   readonly valueCount?: number;
 }
+
+/**
+ * @deprecated Use {@link SerializedShreddedColumnStats} instead.
+ * This alias is provided for backward compatibility.
+ */
+export type ShreddedColumnStats = SerializedShreddedColumnStats;
 
 /**
  * Options for creating shredded column statistics.
@@ -158,6 +175,9 @@ export function serializeShreddedBound(
 ): Uint8Array {
   switch (type) {
     case 'boolean': {
+      if (typeof value !== 'boolean') {
+        throw new Error(`Expected boolean for type '${type}', got ${typeof value}`);
+      }
       const result = new Uint8Array(1);
       result[0] = value ? 1 : 0;
       return result;
@@ -165,9 +185,12 @@ export function serializeShreddedBound(
 
     case 'int':
     case 'date': {
+      if (typeof value !== 'number') {
+        throw new Error(`Expected number for type '${type}', got ${typeof value}`);
+      }
       const buffer = new ArrayBuffer(4);
       const view = new DataView(buffer);
-      view.setInt32(0, value as number, true); // little-endian
+      view.setInt32(0, value, true); // little-endian
       return new Uint8Array(buffer);
     }
 
@@ -177,30 +200,42 @@ export function serializeShreddedBound(
     case 'timestamp_ns':
     case 'timestamptz_ns':
     case 'time': {
+      if (typeof value !== 'number' && typeof value !== 'bigint') {
+        throw new Error(`Expected number or bigint for type '${type}', got ${typeof value}`);
+      }
       const buffer = new ArrayBuffer(8);
       const view = new DataView(buffer);
-      const bigValue = typeof value === 'bigint' ? value : BigInt(value as number);
+      const bigValue = typeof value === 'bigint' ? value : BigInt(value);
       view.setBigInt64(0, bigValue, true); // little-endian
       return new Uint8Array(buffer);
     }
 
     case 'float': {
+      if (typeof value !== 'number') {
+        throw new Error(`Expected number for type '${type}', got ${typeof value}`);
+      }
       const buffer = new ArrayBuffer(4);
       const view = new DataView(buffer);
-      view.setFloat32(0, value as number, true); // little-endian
+      view.setFloat32(0, value, true); // little-endian
       return new Uint8Array(buffer);
     }
 
     case 'double': {
+      if (typeof value !== 'number') {
+        throw new Error(`Expected number for type '${type}', got ${typeof value}`);
+      }
       const buffer = new ArrayBuffer(8);
       const view = new DataView(buffer);
-      view.setFloat64(0, value as number, true); // little-endian
+      view.setFloat64(0, value, true); // little-endian
       return new Uint8Array(buffer);
     }
 
     case 'string':
     case 'uuid': {
-      return new TextEncoder().encode(value as string);
+      if (typeof value !== 'string') {
+        throw new Error(`Expected string for type '${type}', got ${typeof value}`);
+      }
+      return new TextEncoder().encode(value);
     }
 
     case 'binary':
@@ -208,8 +243,10 @@ export function serializeShreddedBound(
       if (value instanceof Uint8Array) {
         return value;
       }
-      // Assume it's an array-like of numbers
-      return new Uint8Array(value as number[]);
+      if (Array.isArray(value) && value.every((v) => typeof v === 'number')) {
+        return new Uint8Array(value);
+      }
+      throw new Error(`Expected Uint8Array or number[] for type '${type}', got ${typeof value}`);
     }
 
     default: {
@@ -384,42 +421,7 @@ export function applyShreddedStatsToDataFile(
 function compareBounds(a: Uint8Array, b: Uint8Array, type: IcebergPrimitiveType): number {
   const valueA = deserializeShreddedBound(a, type);
   const valueB = deserializeShreddedBound(b, type);
-
-  // Handle BigInt comparison
-  if (typeof valueA === 'bigint' && typeof valueB === 'bigint') {
-    if (valueA < valueB) return -1;
-    if (valueA > valueB) return 1;
-    return 0;
-  }
-
-  // Handle number comparison
-  if (typeof valueA === 'number' && typeof valueB === 'number') {
-    return valueA - valueB;
-  }
-
-  // Handle string comparison
-  if (typeof valueA === 'string' && typeof valueB === 'string') {
-    return valueA.localeCompare(valueB);
-  }
-
-  // Handle boolean comparison
-  if (typeof valueA === 'boolean' && typeof valueB === 'boolean') {
-    return (valueA ? 1 : 0) - (valueB ? 1 : 0);
-  }
-
-  // Handle binary comparison (byte-by-byte)
-  if (valueA instanceof Uint8Array && valueB instanceof Uint8Array) {
-    const minLen = Math.min(valueA.length, valueB.length);
-    for (let i = 0; i < minLen; i++) {
-      if (valueA[i] !== valueB[i]) {
-        return valueA[i] - valueB[i];
-      }
-    }
-    return valueA.length - valueB.length;
-  }
-
-  // Fallback: string comparison
-  return String(valueA).localeCompare(String(valueB));
+  return compareValues(valueA, valueB, type);
 }
 
 /**

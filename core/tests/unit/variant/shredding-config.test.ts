@@ -439,7 +439,7 @@ describe('Variant Shredding Configuration', () => {
   });
 
   describe('Validation', () => {
-    it('should pass validation for valid config', () => {
+    it('should return valid:true for valid config', () => {
       const config: VariantShredConfig = {
         columnName: '$data',
         fields: ['title', 'year'],
@@ -449,40 +449,48 @@ describe('Variant Shredding Configuration', () => {
         },
       };
 
-      expect(() => validateShredConfig(config)).not.toThrow();
+      const result = validateShredConfig(config);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
     });
 
-    it('should throw on empty column name', () => {
+    it('should return error on empty column name', () => {
       const config: VariantShredConfig = {
         columnName: '',
         fields: ['title'],
         fieldTypes: {},
       };
 
-      expect(() => validateShredConfig(config)).toThrow(/column name/i);
+      const result = validateShredConfig(config);
+      expect(result.valid).toBe(false);
+      expect(result.errors.some((e) => /column name/i.test(e))).toBe(true);
     });
 
-    it('should throw on whitespace-only column name', () => {
+    it('should return error on whitespace-only column name', () => {
       const config: VariantShredConfig = {
         columnName: '   ',
         fields: ['title'],
         fieldTypes: {},
       };
 
-      expect(() => validateShredConfig(config)).toThrow(/column name/i);
+      const result = validateShredConfig(config);
+      expect(result.valid).toBe(false);
+      expect(result.errors.some((e) => /column name/i.test(e))).toBe(true);
     });
 
-    it('should throw on empty fields array', () => {
+    it('should return error on empty fields array', () => {
       const config: VariantShredConfig = {
         columnName: '$data',
         fields: [],
         fieldTypes: {},
       };
 
-      expect(() => validateShredConfig(config)).toThrow(/fields/i);
+      const result = validateShredConfig(config);
+      expect(result.valid).toBe(false);
+      expect(result.errors.some((e) => /field/i.test(e))).toBe(true);
     });
 
-    it('should throw on invalid field type', () => {
+    it('should return error on invalid field type', () => {
       const config: VariantShredConfig = {
         columnName: '$data',
         fields: ['title'],
@@ -491,10 +499,12 @@ describe('Variant Shredding Configuration', () => {
         },
       };
 
-      expect(() => validateShredConfig(config)).toThrow(/field type/i);
+      const result = validateShredConfig(config);
+      expect(result.valid).toBe(false);
+      expect(result.errors.some((e) => /field type/i.test(e))).toBe(true);
     });
 
-    it('should allow all valid primitive types', () => {
+    it('should return valid:true for all valid primitive types', () => {
       const validTypes: IcebergPrimitiveType[] = [
         'boolean',
         'int',
@@ -519,11 +529,13 @@ describe('Variant Shredding Configuration', () => {
           fieldTypes: { field: type },
         };
 
-        expect(() => validateShredConfig(config)).not.toThrow();
+        const result = validateShredConfig(config);
+        expect(result.valid).toBe(true);
+        expect(result.errors).toHaveLength(0);
       }
     });
 
-    it('should validate field types reference existing fields', () => {
+    it('should return error when field types reference non-existing fields', () => {
       const config: VariantShredConfig = {
         columnName: '$data',
         fields: ['title'],
@@ -532,10 +544,12 @@ describe('Variant Shredding Configuration', () => {
         },
       };
 
-      expect(() => validateShredConfig(config)).toThrow(/field.*not.*declared/i);
+      const result = validateShredConfig(config);
+      expect(result.valid).toBe(false);
+      expect(result.errors.some((e) => /field.*not.*declared/i.test(e))).toBe(true);
     });
 
-    it('should allow fieldTypes to be a subset of fields', () => {
+    it('should return valid:true when fieldTypes is a subset of fields', () => {
       const config: VariantShredConfig = {
         columnName: '$data',
         fields: ['title', 'year', 'rating'],
@@ -544,7 +558,22 @@ describe('Variant Shredding Configuration', () => {
         },
       };
 
-      expect(() => validateShredConfig(config)).not.toThrow();
+      const result = validateShredConfig(config);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
+    });
+
+    it('should collect multiple errors in a single validation', () => {
+      const config: VariantShredConfig = {
+        columnName: '',
+        fields: [],
+        fieldTypes: {},
+      };
+
+      const result = validateShredConfig(config);
+      expect(result.valid).toBe(false);
+      // Should have at least 2 errors: column name and fields
+      expect(result.errors.length).toBeGreaterThanOrEqual(2);
     });
   });
 

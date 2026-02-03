@@ -409,4 +409,187 @@ function isTypeWidened(oldType, newType) {
     }
     return false;
 }
+/**
+ * Validate a field with 'unknown' type.
+ *
+ * Per the Iceberg v3 spec, unknown type fields:
+ * - MUST be optional (required: false)
+ * - Always have null values (not stored in data files)
+ *
+ * @param field - The struct field to validate
+ * @returns Validation result with any errors
+ */
+export function validateUnknownTypeField(field) {
+    const errors = [];
+    // Only validate if the type is 'unknown'
+    if (field.type === 'unknown') {
+        // Unknown type fields MUST be optional
+        if (field.required === true) {
+            errors.push(`Field '${field.name}' with type 'unknown' must be optional (required: false)`);
+        }
+    }
+    return {
+        valid: errors.length === 0,
+        errors,
+    };
+}
+/**
+ * Validate all fields in a schema, including nested struct fields.
+ *
+ * Validates:
+ * - Unknown type fields must be optional
+ * - Default values for special types (unknown, variant, geometry, geography)
+ * - Nested struct fields are validated recursively
+ *
+ * @param schema - The schema to validate
+ * @returns Validation result with any errors
+ */
+export function validateSchema(schema) {
+    const errors = [];
+    function validateFields(fields) {
+        for (const field of fields) {
+            // Validate unknown type fields
+            const unknownResult = validateUnknownTypeField(field);
+            if (!unknownResult.valid) {
+                errors.push(...unknownResult.errors);
+            }
+            // Validate default values
+            const defaultResult = validateFieldDefault(field);
+            if (!defaultResult.valid) {
+                errors.push(...defaultResult.errors);
+            }
+            // Recursively validate nested struct fields
+            if (typeof field.type === 'object' && field.type.type === 'struct') {
+                validateFields(field.type.fields);
+            }
+        }
+    }
+    validateFields(schema.fields);
+    return {
+        valid: errors.length === 0,
+        errors,
+    };
+}
+// ============================================================================
+// Default Values Validation (Iceberg v3)
+// ============================================================================
+import { isGeospatialType } from './types.js';
+/**
+ * Check if a type requires null default (unknown, variant, geometry, geography).
+ */
+function requiresNullDefault(type) {
+    if (typeof type === 'string') {
+        if (type === 'unknown' || type === 'variant') {
+            return true;
+        }
+        // Check for geospatial types (geometry and geography, including parameterized forms)
+        if (isGeospatialType(type)) {
+            return true;
+        }
+    }
+    return false;
+}
+/**
+ * Check if a default value is an empty object (for struct types).
+ */
+function isEmptyObject(value) {
+    return (typeof value === 'object' &&
+        value !== null &&
+        !Array.isArray(value) &&
+        Object.keys(value).length === 0);
+}
+/**
+ * Validate default value for a field.
+ *
+ * Per the Iceberg spec:
+ * - Fields with type unknown, variant, geometry, or geography MUST have null defaults
+ * - Struct defaults must be empty {} or null (sub-field defaults tracked separately)
+ * - Required fields being added to an existing table must have initial-default
+ *
+ * @param field - The struct field to validate
+ * @param options - Validation options
+ * @returns Validation result with any errors
+ */
+export function validateFieldDefault(field, options = {}) {
+    const errors = [];
+    const { isNewField = false } = options;
+    const hasInitialDefault = 'initial-default' in field;
+    const hasWriteDefault = 'write-default' in field;
+    const initialDefault = field['initial-default'];
+    const writeDefault = field['write-default'];
+    // Check types that require null defaults
+    if (requiresNullDefault(field.type)) {
+        const typeName = typeof field.type === 'string' ? field.type : field.type.type;
+        if (hasInitialDefault && initialDefault !== null) {
+            errors.push(`Field '${field.name}' with type '${typeName}' must have null default`);
+        }
+        if (hasWriteDefault && writeDefault !== null) {
+            errors.push(`Field '${field.name}' with type '${typeName}' must have null default`);
+        }
+    }
+    // Check struct type defaults (must be {} or null)
+    if (typeof field.type === 'object' && field.type.type === 'struct') {
+        if (hasInitialDefault && initialDefault !== null && !isEmptyObject(initialDefault)) {
+            errors.push(`Field '${field.name}' with struct type must have empty {} or null as default`);
+        }
+        if (hasWriteDefault && writeDefault !== null && !isEmptyObject(writeDefault)) {
+            errors.push(`Field '${field.name}' with struct type must have empty {} or null as default`);
+        }
+    }
+    // Check required field defaults when adding to existing table
+    if (isNewField && field.required) {
+        if (!hasInitialDefault) {
+            errors.push(`Required field '${field.name}' must have initial-default when adding to existing table`);
+        }
+        else if (initialDefault === null) {
+            errors.push(`Required field '${field.name}' cannot have null as initial-default when adding to existing table`);
+        }
+    }
+    return {
+        valid: errors.length === 0,
+        errors,
+    };
+}
+/**
+ * Check if initial-default can be changed between schema versions.
+ *
+ * Per the Iceberg spec, initial-default cannot be changed once set.
+ *
+ * @param oldField - The old field definition
+ * @param newField - The new field definition
+ * @returns Whether the change is allowed
+ */
+export function canChangeInitialDefault(oldField, newField) {
+    const hadInitialDefault = 'initial-default' in oldField;
+    const hasInitialDefault = 'initial-default' in newField;
+    // If old field didn't have initial-default, can set it now
+    if (!hadInitialDefault) {
+        return { allowed: true };
+    }
+    // If old field had initial-default but new doesn't, that's an error
+    // (initial-default cannot be removed once set)
+    if (hadInitialDefault && !hasInitialDefault) {
+        return { allowed: false, reason: 'initial-default cannot be removed once set' };
+    }
+    // If both have initial-default, they must be the same
+    const oldDefault = oldField['initial-default'];
+    const newDefault = newField['initial-default'];
+    if (JSON.stringify(oldDefault) !== JSON.stringify(newDefault)) {
+        return { allowed: false, reason: 'initial-default cannot be changed once set' };
+    }
+    return { allowed: true };
+}
+/**
+ * Check if write-default can be changed between schema versions.
+ *
+ * Per the Iceberg spec, write-default can be changed through schema evolution.
+ *
+ * @param _oldField - The old field definition (unused, write-default can always change)
+ * @param _newField - The new field definition (unused)
+ * @returns Whether the change is allowed (always true)
+ */
+export function canChangeWriteDefault(_oldField, _newField) {
+    // write-default can always be changed, added, or removed
+    return { allowed: true };
+}
 //# sourceMappingURL=schema.js.map

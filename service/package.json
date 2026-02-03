@@ -1,6 +1,6 @@
 {
   "name": "iceberg.do",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Iceberg REST Catalog as a Service - managed Iceberg catalog on Cloudflare Workers",
   "type": "module",
   "main": "./dist/index.js",
@@ -12,6 +12,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "iceberg",

@@ -6,7 +6,7 @@
  *
  * @see https://iceberg.apache.org/spec/
  */
-import type { IcebergSchema, PartitionSpec, SortOrder, SnapshotRef, SnapshotLogEntry, ManifestFile, TableMetadata, Snapshot } from './types.js';
+import type { IcebergSchema, PartitionSpec, SortOrder, SnapshotRef, SnapshotLogEntry, ManifestFile, TableMetadata, Snapshot, EncryptionKey } from './types.js';
 /** Options for creating a new snapshot */
 export interface CreateSnapshotOptions {
     parentSnapshotId?: number;
@@ -23,6 +23,12 @@ export interface CreateTableOptions {
     partitionSpec?: PartitionSpec;
     sortOrder?: SortOrder;
     properties?: Record<string, string>;
+    /** Format version (2 or 3). Defaults to 2 for backward compatibility. */
+    formatVersion?: 2 | 3;
+    /** Initial next-row-id value (v3 only). Defaults to 0 for v3 tables. */
+    nextRowId?: number;
+    /** Optional encryption keys for table encryption. */
+    encryptionKeys?: EncryptionKey[];
 }
 /** Snapshot retention policy configuration */
 export interface SnapshotRetentionPolicy {
@@ -64,6 +70,10 @@ export declare class SnapshotBuilder {
     private manifestListPath;
     private schemaId;
     private summaryStats;
+    private formatVersion;
+    private firstRowId?;
+    private addedRows?;
+    private keyId?;
     constructor(options: {
         sequenceNumber: number;
         snapshotId?: number;
@@ -72,6 +82,14 @@ export declare class SnapshotBuilder {
         operation?: 'append' | 'replace' | 'overwrite' | 'delete';
         manifestListPath: string;
         schemaId?: number;
+        /** Format version (2 or 3). Defaults to 2 for backward compatibility. */
+        formatVersion?: 2 | 3;
+        /** First row ID for v3 snapshots (required for v3, optional for v2). */
+        firstRowId?: number;
+        /** Number of rows added by this snapshot (required for v3, optional for v2). */
+        addedRows?: number;
+        /** ID of the encryption key that encrypts the manifest list key metadata. */
+        keyId?: number;
     });
     /**
      * Set summary statistics from manifest list.
@@ -104,9 +122,34 @@ export declare class TableMetadataBuilder {
     private metadata;
     constructor(options: CreateTableOptions);
     /**
-     * Create a builder from existing metadata.
+     * Options for creating a builder from existing metadata.
      */
-    static fromMetadata(metadata: TableMetadata): TableMetadataBuilder;
+    static fromMetadataOptions?: {
+        /**
+         * Upgrade the table to a new format version.
+         * If specified and different from the current version, performs an upgrade.
+         */
+        formatVersion?: 2 | 3;
+    };
+    /**
+     * Create a builder from existing metadata.
+     *
+     * @param metadata - The existing table metadata
+     * @param options - Optional settings for the builder, including format version upgrade
+     * @returns A new TableMetadataBuilder
+     *
+     * @example
+     * ```ts
+     * // Simple copy
+     * const builder = TableMetadataBuilder.fromMetadata(existingMetadata);
+     *
+     * // Upgrade from v2 to v3
+     * const builder = TableMetadataBuilder.fromMetadata(v2Metadata, { formatVersion: 3 });
+     * ```
+     */
+    static fromMetadata(metadata: TableMetadata, options?: {
+        formatVersion?: 2 | 3;
+    }): TableMetadataBuilder;
     /**
      * Find the maximum field ID in a schema.
      */
@@ -147,6 +190,10 @@ export declare class TableMetadataBuilder {
      * Remove a table property.
      */
     removeProperty(key: string): this;
+    /**
+     * Add an encryption key to the table.
+     */
+    addEncryptionKey(key: EncryptionKey): this;
     /**
      * Add a snapshot reference (branch or tag).
      */
