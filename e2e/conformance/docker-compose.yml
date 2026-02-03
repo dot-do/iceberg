@@ -1,0 +1,45 @@
+# Docker Compose configuration for RCK tests with MinIO
+#
+# MinIO provides S3-compatible storage that both the test client and the
+# iceberg.do server can access during local development and testing.
+#
+# Usage:
+#   docker-compose up -d          # Start MinIO in background
+#   docker-compose down           # Stop and remove containers
+#   docker-compose down -v        # Stop and remove containers + volumes
+#
+# Access:
+#   API endpoint: http://localhost:9000
+#   Console:      http://localhost:9001
+#   Credentials:  minioadmin / minioadmin
+#
+# For RCK tests, use:
+#   ./run-rck.sh --with-minio
+
+version: '3.8'
+
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: iceberg-minio
+    ports:
+      # S3 API port - used by the iceberg.do server and test clients
+      - "9000:9000"
+      # MinIO Console - web UI for browsing buckets and objects
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      # Persist data between runs (optional - remove for ephemeral storage)
+      - minio-data:/data
+
+volumes:
+  minio-data:
+    driver: local

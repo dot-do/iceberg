@@ -1410,20 +1410,14 @@ function getConflictingRequirements(
     }
   });
 
-  // Return conflicts without sorting - preserve the order requirements were validated.
+  // Return conflicts in the same order they were sent in the request.
   // The Iceberg client sends requirements in a specific order and tests expect
   // the first failing requirement in that order to be returned.
   //
-  // Only exception: assert-table-uuid and assert-create should always be first
-  // as these are fundamental failures that can't be worked around.
-  const critical = conflicts.filter(c =>
-    c.type === 'assert-table-uuid' || c.type === 'assert-create'
-  );
-  const other = conflicts.filter(c =>
-    c.type !== 'assert-table-uuid' && c.type !== 'assert-create'
-  );
-
-  return [...critical, ...other];
+  // For example, deleteColumn sends assert-current-schema-id first,
+  // while addColumn sends assert-last-assigned-field-id first.
+  // We must respect this order so the correct error message is returned.
+  return conflicts;
 }
 
 /**

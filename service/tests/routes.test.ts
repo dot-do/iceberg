@@ -23,6 +23,10 @@ interface MockEnv {
   };
   R2_BUCKET?: MockR2Bucket;
   ENVIRONMENT: string;
+  // R2 S3-compatible credentials for external client data access
+  R2_URL?: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
 }
 
 interface MockDurableObjectStub {
@@ -443,6 +447,66 @@ describe('Iceberg REST Catalog Routes', () => {
       const data = await res.json();
       expect(data).toHaveProperty('defaults');
       expect(data).toHaveProperty('overrides');
+    });
+
+    it('should return S3 credentials when R2 environment variables are configured', async () => {
+      // Create environment with R2 credentials
+      const envWithR2Creds = {
+        ...env,
+        R2_URL: 'https://test-account.r2.cloudflarestorage.com',
+        R2_ACCESS_KEY_ID: 'test-access-key',
+        R2_SECRET_ACCESS_KEY: 'test-secret-key',
+      };
+
+      const req = new Request('http://test/v1/config', { method: 'GET' });
+      const res = await app.fetch(req, envWithR2Creds);
+      expect(res.status).toBe(200);
+
+      const data = await res.json() as { defaults: Record<string, string> };
+
+      // Verify all S3 credentials are returned
+      expect(data.defaults['s3.endpoint']).toBe('https://test-account.r2.cloudflarestorage.com');
+      expect(data.defaults['s3.access-key-id']).toBe('test-access-key');
+      expect(data.defaults['s3.secret-access-key']).toBe('test-secret-key');
+      expect(data.defaults['s3.region']).toBe('auto');
+      expect(data.defaults['s3.path-style-access']).toBe('true');
+    });
+
+    it('should not return S3 credentials when R2 environment variables are not configured', async () => {
+      const res = await request('GET', '/v1/config');
+      expect(res.status).toBe(200);
+
+      const data = await res.json() as { defaults: Record<string, string> };
+
+      // Verify S3 credentials are not present
+      expect(data.defaults['s3.endpoint']).toBeUndefined();
+      expect(data.defaults['s3.access-key-id']).toBeUndefined();
+      expect(data.defaults['s3.secret-access-key']).toBeUndefined();
+      expect(data.defaults['s3.region']).toBeUndefined();
+      expect(data.defaults['s3.path-style-access']).toBeUndefined();
+    });
+
+    it('should return partial S3 config when only some R2 variables are set', async () => {
+      // Create environment with only R2_URL
+      const envPartial = {
+        ...env,
+        R2_URL: 'https://partial-account.r2.cloudflarestorage.com',
+      };
+
+      const req = new Request('http://test/v1/config', { method: 'GET' });
+      const res = await app.fetch(req, envPartial);
+      expect(res.status).toBe(200);
+
+      const data = await res.json() as { defaults: Record<string, string> };
+
+      // Endpoint and related settings should be set
+      expect(data.defaults['s3.endpoint']).toBe('https://partial-account.r2.cloudflarestorage.com');
+      expect(data.defaults['s3.region']).toBe('auto');
+      expect(data.defaults['s3.path-style-access']).toBe('true');
+
+      // Credentials should not be present
+      expect(data.defaults['s3.access-key-id']).toBeUndefined();
+      expect(data.defaults['s3.secret-access-key']).toBeUndefined();
     });
   });
 

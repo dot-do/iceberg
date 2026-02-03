@@ -46,6 +46,14 @@ AUTH_ENABLED = "false"
 AUTH_ALLOW_ANONYMOUS_READ = "true"
 # CATALOG_BACKEND = "durable-object"  # or "d1"
 
+# R2 S3-compatible credentials for external client data access
+# When configured, these are returned via /v1/config to allow clients
+# (Spark, PyIceberg, DuckDB) to write data files directly to R2.
+# Create R2 API tokens at: https://dash.cloudflare.com/<account_id>/r2/api-tokens
+# R2_URL = "https://<account_id>.r2.cloudflarestorage.com"
+# R2_ACCESS_KEY_ID = "<your-r2-access-key-id>"
+# R2_SECRET_ACCESS_KEY = "<your-r2-secret-access-key>"
+
 # Optional: JWKS URI for direct JWT validation (when not using service binding)
 # OAUTH_JWKS_URI = "https://api.workos.com/sso/jwks/client_xxx"
 # OAUTH_CLIENT_ID = "your-workos-client-id"
