@@ -14,7 +14,8 @@
     "test:conformance:rck": "bash e2e/conformance/run-rck.sh",
     "test:conformance:pyiceberg": "bash e2e/conformance/run-pyiceberg-tests.sh",
     "lint": "pnpm -r lint",
-    "dev": "pnpm -r dev"
+    "dev": "pnpm -r dev",
+    "bench": "vitest bench --config tests/benchmarks/vitest.config.ts"
   },
   "engines": {
     "node": ">=18.0.0"
