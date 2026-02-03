@@ -1410,14 +1410,26 @@ function getConflictingRequirements(
     }
   });
 
-  // Return conflicts in the same order they were sent in the request.
-  // The Iceberg client sends requirements in a specific order and tests expect
-  // the first failing requirement in that order to be returned.
-  //
-  // For example, deleteColumn sends assert-current-schema-id first,
-  // while addColumn sends assert-last-assigned-field-id first.
-  // We must respect this order so the correct error message is returned.
-  return conflicts;
+  // Sort conflicts to prioritize the most meaningful error message:
+  // - For schema conflicts, assert-current-schema-id is the primary indicator
+  //   (the schema changed), while assert-last-assigned-field-id is secondary
+  // - For partition conflicts, assert-default-spec-id before assert-last-assigned-partition-id
+  // - Critical requirements (assert-table-uuid, assert-create) come first
+  const priority: Record<string, number> = {
+    'assert-table-uuid': 0,
+    'assert-create': 0,
+    'assert-current-schema-id': 1,
+    'assert-last-assigned-field-id': 2,
+    'assert-default-spec-id': 1,
+    'assert-last-assigned-partition-id': 2,
+    'assert-default-sort-order-id': 1,
+  };
+
+  return conflicts.sort((a, b) => {
+    const pa = priority[a.type] ?? 99;
+    const pb = priority[b.type] ?? 99;
+    return pa - pb;
+  });
 }
 
 /**

@@ -1240,9 +1240,10 @@ describe('Iceberg REST Catalog Routes', () => {
         expect(errorData.error.message).toContain('current schema changed');
       });
 
-      it('should return first failing requirement in request order when multiple fail', async () => {
-        // When multiple requirements fail, return the first one in the order they were checked
-        // (not sorted by any priority - this matches Iceberg client expectations)
+      it('should prioritize assert-current-schema-id over assert-last-assigned-field-id in schema conflicts', async () => {
+        // When both schema-related requirements fail, assert-current-schema-id is prioritized
+        // because it's the primary indicator that the schema has changed. This matches
+        // Iceberg RCK testUpdateTableSchemaConflict expectations.
 
         // Create table with initial schema
         const createRes = await request('POST', '/v1/namespaces/test_db/tables', {
@@ -1280,14 +1281,14 @@ describe('Iceberg REST Catalog Routes', () => {
         });
         expect(firstUpdateRes.status).toBe(200);
 
-        // Second client sends field-id requirement FIRST
-        // The error should be about field id since it's checked first
+        // Second client sends field-id requirement FIRST, but server should
+        // prioritize assert-current-schema-id as the more meaningful error
         const conflictRes = await request('POST', '/v1/namespaces/test_db/tables/schema_order_test', {
           requirements: [
             { type: 'assert-table-uuid', uuid: tableUuid },
-            // Field id first
+            // Field id first in request
             { type: 'assert-last-assigned-field-id', 'last-assigned-field-id': originalFieldId },
-            // Schema id second
+            // Schema id second in request
             { type: 'assert-current-schema-id', 'current-schema-id': originalSchemaId },
           ],
           updates: [
@@ -1308,8 +1309,8 @@ describe('Iceberg REST Catalog Routes', () => {
 
         expect(conflictRes.status).toBe(409);
         const errorData = await conflictRes.json() as { error: { message: string; type: string } };
-        // Should return the first failing requirement in request order
-        expect(errorData.error.message).toContain('last assigned field id changed');
+        // Should prioritize current-schema-id as the primary schema change indicator
+        expect(errorData.error.message).toContain('current schema changed');
       });
 
       it('should allow partition spec update then revert (testUpdateTableSpecThenRevert)', async () => {
